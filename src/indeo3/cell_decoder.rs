@@ -518,7 +518,11 @@ impl<'a, 'b> Walker<'a, 'b> {
 
     /// Resolve the 1 KB primary / secondary code tables for a mode
     /// byte's base and band.
-    fn tables(&self, base: CodeBase, band: u8) -> Result<(&'b [u8], &'b [u8]), CellDecodeError> {
+    fn tables(
+        &self,
+        base: CodeBase,
+        band: u8,
+    ) -> Result<(&'b CodeTable, &'b CodeTable), CellDecodeError> {
         match base {
             CodeBase::Staging => {
                 let block = i64::from(self.ctx.cb_offset) + i64::from(band);
@@ -527,7 +531,10 @@ impl<'a, 'b> Walker<'a, 'b> {
                 }
                 let off = block as usize * STAGING_BLOCK_STRIDE;
                 let bytes = self.ctx.staging.as_bytes();
-                Ok((&bytes[off..off + 0x400], &bytes[off + 0x400..off + 0x800]))
+                Ok((
+                    bytes[off..off + 0x400].try_into().unwrap(),
+                    bytes[off + 0x400..off + 0x800].try_into().unwrap(),
+                ))
             }
             CodeBase::Arena => {
                 let p = VqArena::band_primary_offset(usize::from(band))
@@ -535,7 +542,10 @@ impl<'a, 'b> Walker<'a, 'b> {
                 let s = VqArena::band_secondary_offset(usize::from(band))
                     .ok_or(CellDecodeError::BadStagingBlock)?;
                 let bytes = &self.ctx.arena.as_bytes()[..];
-                Ok((&bytes[p..p + 0x400], &bytes[s..s + 0x400]))
+                Ok((
+                    bytes[p..p + 0x400].try_into().unwrap(),
+                    bytes[s..s + 0x400].try_into().unwrap(),
+                ))
             }
         }
     }
@@ -611,87 +621,65 @@ impl<'a, 'b> Walker<'a, 'b> {
         }
     }
 
-    /// One literal code (`spec/07 §2.1`/`§2.3`): the raw `pred +
-    /// table[b]` decides the one-byte / two-byte form by its bit 31 (a
-    /// seed word's `0x8000` bias always sets it); the pixels then take
-    /// the word's two dyads — the high lane from `b`, and for the
-    /// two-byte form the low lane from the continuation byte `c`'s
-    /// high word — each applied through [`apply_dyad`].
-    fn literal(&mut self, table: &[u8], b: u8, pred: u32) -> Result<u32, CellDecodeError> {
-        let e = usize::from(b) * 4;
-        let word = u32::from_le_bytes(table[e..e + 4].try_into().unwrap());
-        let sum = pred.wrapping_add(word);
-        let (lo_dyad, hi_dyad) = if sum & 0x8000_0000 == 0 {
-            // One-byte form: `(B[i] << 16) + sext16(B[j])`.
-            let lo = word as u16;
-            let borrow = u16::from(lo & 0x8000 != 0);
-            let hi = ((word >> 16) as u16).wrapping_add(borrow);
-            (lo, hi)
-        } else {
-            let c = self.r.byte()?;
-            let ce = usize::from(c) * 4 + 2;
-            let c_hi = u16::from_le_bytes(table[ce..ce + 2].try_into().unwrap());
-            (
-                c_hi.wrapping_sub(0x8000),
-                ((word >> 16) as u16).wrapping_sub(0x8000),
-            )
-        };
-        let out_lo = apply_dyad(pred as u16, lo_dyad);
-        let out_hi = apply_dyad((pred >> 16) as u16, hi_dyad);
-        let out = (u32::from(out_hi) << 16) | u32::from(out_lo);
-        if out & 0x8080_8080 != 0 {
-            return Err(CellDecodeError::RangeFault);
-        }
-        Ok(out)
-    }
-
     /// Families A / B: 4×4 blocks, row-group major, one code per row.
+    ///
+    /// Each block works on a window of its strip that starts at the
+    /// row above the block: window row `p + 1` is block row `p`.
     fn body_4x4(
         &mut self,
         cell: &CellRect,
-        primary: &[u8],
-        secondary: &[u8],
+        primary: &CodeTable,
+        secondary: &CodeTable,
         own_predictor: bool,
     ) -> Result<(), CellDecodeError> {
-        let groups = cell.h / 4;
+        const S: usize = STRIP_ROW_STRIDE as usize;
         let cols = cell.w / 4;
-        let total = groups * cols;
+        let total = (cell.h / 4) * cols;
+        let Walker {
+            r, bufs, sticky, ..
+        } = self;
+        let s = &mut bufs.strips[cell.strip][..];
+        let (mut g, mut c) = (0u32, 0u32);
         let mut block = 0u32;
         // A pending run of predictor / marker positions (0xFB).
         let mut run_fill = 0u32;
         let mut run_mark = 0u32;
         while block < total {
-            let g = block / cols;
-            let c = block % cols;
             let y0 = i64::from(cell.y) + 4 * i64::from(g);
             let x0 = cell.x + 4 * c;
+            block += 1;
+            c += 1;
+            if c == cols {
+                c = 0;
+                g += 1;
+            }
+            let base = PlaneBuffers::idx(y0 - 1, x0);
+            let win = &mut s[base..base + 4 * S + 4];
             if run_fill > 0 {
                 run_fill -= 1;
-                self.fill_rows(cell.strip, y0, x0, 0, 4, own_predictor);
-                block += 1;
+                fill_rows(win, 0, 4, own_predictor);
                 continue;
             }
             if run_mark > 0 {
                 run_mark -= 1;
-                block += 1;
                 continue;
             }
             let mut pos = 0u8;
             while pos < 4 {
-                if self.sticky {
+                if *sticky {
                     // A sticky 0xFA / 0xFD repeats without a read.
-                    let b = self.r.peek()?;
+                    let b = r.peek()?;
                     if b == 0xFA {
                         pos = 4;
                         continue;
                     }
                     if b == 0xFD {
-                        self.fill_rows(cell.strip, y0, x0, pos, 4, own_predictor);
+                        fill_rows(win, pos, 4, own_predictor);
                         pos = 4;
                         continue;
                     }
                 }
-                let b = self.r.byte()?;
+                let b = r.byte()?;
                 match b {
                     0x00..=0xF7 => {
                         let table = if pos.is_multiple_of(2) {
@@ -699,10 +687,10 @@ impl<'a, 'b> Walker<'a, 'b> {
                         } else {
                             primary
                         };
-                        let pred =
-                            self.pred_dword(cell.strip, y0 + i64::from(pos), x0, own_predictor);
-                        let v = self.literal(table, b, pred)?;
-                        self.store_dword(cell.strip, y0 + i64::from(pos), x0, v);
+                        let row = (usize::from(pos) + 1) * S;
+                        let pred = read4(win, if own_predictor { row } else { row - S });
+                        let v = literal(r, table, b, pred)?;
+                        write4(win, row, v);
                         pos += 1;
                     }
                     0xF8 => {
@@ -712,9 +700,9 @@ impl<'a, 'b> Walker<'a, 'b> {
                                 position: pos,
                             });
                         }
-                        let v = self.r.byte()? & 0x7f;
+                        let v = r.byte()? & 0x7f;
                         let w = u32::from_le_bytes([v | 0x80, v | 0x80, v | 0x80, v | 0x80]);
-                        self.store_dword(cell.strip, y0, x0, w);
+                        write4(win, S, w);
                         pos += 1;
                     }
                     0xF9 | 0xFA => {
@@ -725,24 +713,24 @@ impl<'a, 'b> Walker<'a, 'b> {
                             });
                         }
                         if b == 0xF9 {
-                            self.sticky = !self.sticky;
+                            *sticky = !*sticky;
                         }
-                        if self.sticky {
-                            self.r.pos -= 1;
+                        if *sticky {
+                            r.pos -= 1;
                         }
                         pos = 4;
                     }
                     0xFB => {
-                        let counter = self.r.byte()?;
+                        let counter = r.byte()?;
                         let (fill, mark) = fb_counter(counter)?;
                         if fill > 0 {
-                            let extra = if self.sticky {
-                                self.sticky = false;
+                            let extra = if *sticky {
+                                *sticky = false;
                                 1
                             } else {
                                 0
                             };
-                            self.fill_rows(cell.strip, y0, x0, pos, 4, own_predictor);
+                            fill_rows(win, pos, 4, own_predictor);
                             run_fill = (fill + extra).saturating_sub(1);
                         } else {
                             run_mark = mark.saturating_sub(1);
@@ -751,11 +739,11 @@ impl<'a, 'b> Walker<'a, 'b> {
                     }
                     0xFC | 0xFD => {
                         if b == 0xFC {
-                            self.sticky = !self.sticky;
+                            *sticky = !*sticky;
                         }
-                        self.fill_rows(cell.strip, y0, x0, pos, 4, own_predictor);
-                        if self.sticky {
-                            self.r.pos -= 1;
+                        fill_rows(win, pos, 4, own_predictor);
+                        if *sticky {
+                            r.pos -= 1;
                         }
                         pos = 4;
                     }
@@ -766,7 +754,7 @@ impl<'a, 'b> Walker<'a, 'b> {
                                 position: pos,
                             });
                         }
-                        self.fill_rows(cell.strip, y0, x0, pos, 3, own_predictor);
+                        fill_rows(win, pos, 3, own_predictor);
                         pos = 3;
                     }
                     0xFF => {
@@ -776,62 +764,75 @@ impl<'a, 'b> Walker<'a, 'b> {
                                 position: pos,
                             });
                         }
-                        self.fill_rows(cell.strip, y0, x0, 0, 2, own_predictor);
+                        fill_rows(win, 0, 2, own_predictor);
                         pos = 2;
                     }
                 }
             }
-            block += 1;
         }
         Ok(())
     }
 
     /// Families E / F: 8×8 blocks, four codes per block, each producing
     /// a horizontally doubled row stored as a `(avg, cur)` row pair.
+    ///
+    /// As in [`Self::body_4x4`], window row `k + 1` is block row `k`.
     fn body_8x8(
         &mut self,
         cell: &CellRect,
-        primary: &[u8],
-        secondary: &[u8],
+        primary: &CodeTable,
+        secondary: &CodeTable,
         own_predictor: bool,
     ) -> Result<(), CellDecodeError> {
-        let groups = cell.h / 8;
+        const S: usize = STRIP_ROW_STRIDE as usize;
         let cols = cell.w / 8;
-        let total = groups * cols;
+        let total = (cell.h / 8) * cols;
+        let Walker {
+            r, bufs, sticky, ..
+        } = self;
+        let s = &mut bufs.strips[cell.strip][..];
+        let (mut g, mut c) = (0u32, 0u32);
         let mut block = 0u32;
         let mut run_fill = 0u32;
         let mut run_mark = 0u32;
         while block < total {
-            let g = block / cols;
-            let c = block % cols;
             let y0 = i64::from(cell.y) + 8 * i64::from(g);
             let x0 = cell.x + 8 * c;
+            block += 1;
+            c += 1;
+            if c == cols {
+                c = 0;
+                g += 1;
+            }
+            let base = PlaneBuffers::idx(y0 - 1, x0);
+            let win = &mut s[base..base + 8 * S + 8];
+            // The row pair's first row repeats the decoded row at the
+            // top of the strip (see `store_doubled`).
+            let top = y0 == 0;
             if run_fill > 0 {
                 run_fill -= 1;
-                self.fill_doubled(cell.strip, y0, x0, 0, 4, own_predictor);
-                block += 1;
+                fill_doubled(win, 0, 4, own_predictor, top);
                 continue;
             }
             if run_mark > 0 {
                 run_mark -= 1;
-                block += 1;
                 continue;
             }
             let mut pos = 0u8;
             while pos < 4 {
-                if self.sticky {
-                    let b = self.r.peek()?;
+                if *sticky {
+                    let b = r.peek()?;
                     if b == 0xFA {
                         pos = 4;
                         continue;
                     }
                     if b == 0xFD {
-                        self.fill_doubled(cell.strip, y0, x0, pos, 4, own_predictor);
+                        fill_doubled(win, pos, 4, own_predictor, top);
                         pos = 4;
                         continue;
                     }
                 }
-                let b = self.r.byte()?;
+                let b = r.byte()?;
                 match b {
                     0x00..=0xF7 => {
                         let table = if pos.is_multiple_of(2) {
@@ -839,14 +840,14 @@ impl<'a, 'b> Walker<'a, 'b> {
                         } else {
                             primary
                         };
-                        let prev_row = y0 + 2 * i64::from(pos) - 1;
+                        // Window index of the pair's first row.
+                        let row = (2 * usize::from(pos) + 1) * S;
                         if own_predictor {
                             // Family F: the doubled deltas add to the
                             // motion-compensated content of both rows
                             // of the pair, pixel by pixel.
-                            let row = y0 + 2 * i64::from(pos);
-                            let pred = self.pred_dword_doubled(cell.strip, row - 1, x0, true);
-                            let v = self.literal(table, b, pred)?;
+                            let pred = read_doubled(win, row);
+                            let v = literal(r, table, b, pred)?;
                             let vb = v.to_le_bytes();
                             let pb = pred.to_le_bytes();
                             let d = [
@@ -855,11 +856,11 @@ impl<'a, 'b> Walker<'a, 'b> {
                                 vb[2].wrapping_sub(pb[2]),
                                 vb[3].wrapping_sub(pb[3]),
                             ];
-                            self.add_doubled_deltas(cell.strip, row, x0, d);
+                            add_doubled_deltas(win, row, d);
                         } else {
-                            let pred = self.pred_dword_doubled(cell.strip, prev_row, x0, false);
-                            let v = self.literal(table, b, pred)?;
-                            self.store_doubled(cell.strip, y0 + 2 * i64::from(pos), x0, v);
+                            let pred = read_doubled(win, row - S);
+                            let v = literal(r, table, b, pred)?;
+                            store_doubled(win, row, v, top && pos == 0);
                         }
                         pos += 1;
                     }
@@ -871,24 +872,24 @@ impl<'a, 'b> Walker<'a, 'b> {
                             });
                         }
                         if b == 0xF9 {
-                            self.sticky = !self.sticky;
+                            *sticky = !*sticky;
                         }
-                        if self.sticky {
-                            self.r.pos -= 1;
+                        if *sticky {
+                            r.pos -= 1;
                         }
                         pos = 4;
                     }
                     0xFB => {
-                        let counter = self.r.byte()?;
+                        let counter = r.byte()?;
                         let (fill, mark) = fb_counter(counter)?;
                         if fill > 0 {
-                            let extra = if self.sticky {
-                                self.sticky = false;
+                            let extra = if *sticky {
+                                *sticky = false;
                                 1
                             } else {
                                 0
                             };
-                            self.fill_doubled(cell.strip, y0, x0, pos, 4, own_predictor);
+                            fill_doubled(win, pos, 4, own_predictor, top);
                             run_fill = (fill + extra).saturating_sub(1);
                         } else {
                             run_mark = mark.saturating_sub(1);
@@ -897,11 +898,11 @@ impl<'a, 'b> Walker<'a, 'b> {
                     }
                     0xFC | 0xFD => {
                         if b == 0xFC {
-                            self.sticky = !self.sticky;
+                            *sticky = !*sticky;
                         }
-                        self.fill_doubled(cell.strip, y0, x0, pos, 4, own_predictor);
-                        if self.sticky {
-                            self.r.pos -= 1;
+                        fill_doubled(win, pos, 4, own_predictor, top);
+                        if *sticky {
+                            r.pos -= 1;
                         }
                         pos = 4;
                     }
@@ -912,7 +913,7 @@ impl<'a, 'b> Walker<'a, 'b> {
                                 position: pos,
                             });
                         }
-                        self.fill_doubled(cell.strip, y0, x0, pos, 3, own_predictor);
+                        fill_doubled(win, pos, 3, own_predictor, top);
                         pos = 3;
                     }
                     0xFF => {
@@ -922,7 +923,7 @@ impl<'a, 'b> Walker<'a, 'b> {
                                 position: pos,
                             });
                         }
-                        self.fill_doubled(cell.strip, y0, x0, 0, 2, own_predictor);
+                        fill_doubled(win, 0, 2, own_predictor, top);
                         pos = 2;
                     }
                     0xF8 => {
@@ -933,105 +934,136 @@ impl<'a, 'b> Walker<'a, 'b> {
                     }
                 }
             }
-            block += 1;
         }
         Ok(())
     }
+}
 
-    #[inline]
-    fn pred_dword(&self, strip: usize, y: i64, x: u32, own: bool) -> u32 {
-        let s = &self.bufs.strips[strip];
-        let i = PlaneBuffers::idx(if own { y } else { y - 1 }, x);
-        u32::from_le_bytes(s[i..i + 4].try_into().unwrap())
+/// One 1 KB code table: 256 little-endian words, one per code byte.
+type CodeTable = [u8; 0x400];
+
+/// One literal code (`spec/07 §2.1`/`§2.3`): the raw `pred + table[b]`
+/// decides the one-byte / two-byte form by its bit 31 (a seed word's
+/// `0x8000` bias always sets it); the pixels then take the word's two
+/// dyads — the high lane from `b`, and for the two-byte form the low
+/// lane from the continuation byte `c`'s high word — each applied
+/// through [`apply_dyads`].
+#[inline]
+fn literal(
+    r: &mut Reader<'_>,
+    table: &CodeTable,
+    b: u8,
+    pred: u32,
+) -> Result<u32, CellDecodeError> {
+    let e = usize::from(b) * 4;
+    let word = u32::from_le_bytes(table[e..e + 4].try_into().unwrap());
+    let sum = pred.wrapping_add(word);
+    let (lo_dyad, hi_dyad) = if sum & 0x8000_0000 == 0 {
+        // One-byte form: `(B[i] << 16) + sext16(B[j])`.
+        let lo = word as u16;
+        let borrow = u16::from(lo & 0x8000 != 0);
+        let hi = ((word >> 16) as u16).wrapping_add(borrow);
+        (lo, hi)
+    } else {
+        let c = r.byte()?;
+        let ce = usize::from(c) * 4 + 2;
+        let c_hi = u16::from_le_bytes(table[ce..ce + 2].try_into().unwrap());
+        (
+            c_hi.wrapping_sub(0x8000),
+            ((word >> 16) as u16).wrapping_sub(0x8000),
+        )
+    };
+    let out = apply_dyads(pred, (u32::from(hi_dyad) << 16) | u32::from(lo_dyad));
+    if out & 0x8080_8080 != 0 {
+        return Err(CellDecodeError::RangeFault);
     }
+    Ok(out)
+}
 
-    #[inline]
-    fn store_dword(&mut self, strip: usize, y: i64, x: u32, v: u32) {
-        let s = &mut self.bufs.strips[strip];
-        let i = PlaneBuffers::idx(y, x);
-        s[i..i + 4].copy_from_slice(&v.to_le_bytes());
+#[inline]
+fn read4(win: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(win[i..i + 4].try_into().unwrap())
+}
+
+#[inline]
+fn write4(win: &mut [u8], i: usize, v: u32) {
+    win[i..i + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// Fill rows `from..to` of a 4×4 block window with each row's
+/// predictor (the row above, or the own content for B / D / F).
+#[inline]
+fn fill_rows(win: &mut [u8], from: u8, to: u8, own: bool) {
+    const S: usize = STRIP_ROW_STRIDE as usize;
+    for p in from..to {
+        let row = (usize::from(p) + 1) * S;
+        let v = read4(win, if own { row } else { row - S });
+        write4(win, row, v);
     }
+}
 
-    /// Fill rows `from..to` of a 4-wide column block with each row's
-    /// predictor (the row above, or the own content for B / D / F).
-    fn fill_rows(&mut self, strip: usize, y0: i64, x0: u32, from: u8, to: u8, own: bool) {
-        for p in from..to {
-            let y = y0 + i64::from(p);
-            let v = self.pred_dword(strip, y, x0, own);
-            self.store_dword(strip, y, x0, v);
-        }
+/// The doubled-family predictor: every other byte of the row at
+/// window index `i` (the doubled pixels' left halves).
+#[inline]
+fn read_doubled(win: &[u8], i: usize) -> u32 {
+    let p: &[u8; 7] = win[i..i + 7].try_into().unwrap();
+    u32::from_le_bytes([p[0], p[2], p[4], p[6]])
+}
+
+/// Store a decoded 4-byte row doubled horizontally as the row pair
+/// whose first row is at window index `i`: the second row takes the
+/// decoded row and the first its average with the row above. At the
+/// top of the strip (`repeat`) the row above is the predictor padding,
+/// so the decoded row repeats (fixture-arbitrated r451 / r459: every E
+/// cell of the all-intra fixture, at the strip top and below).
+#[inline]
+fn store_doubled(win: &mut [u8], i: usize, v: u32, repeat: bool) {
+    const S: usize = STRIP_ROW_STRIDE as usize;
+    let b = v.to_le_bytes();
+    let cur = u64::from_le_bytes([b[0], b[0], b[1], b[1], b[2], b[2], b[3], b[3]]);
+    let first = if repeat {
+        cur
+    } else {
+        // Bytewise `((prev & 0x7f) + (cur & 0x7f)) >> 1`: the 7-bit
+        // sums fit their bytes, and the final mask drops the bit each
+        // byte's shift takes from the byte above it.
+        let prev = u64::from_le_bytes(win[i - S..i - S + 8].try_into().unwrap());
+        (((prev & LOW7) + (cur & LOW7)) >> 1) & LOW7
+    };
+    win[i..i + 8].copy_from_slice(&first.to_le_bytes());
+    win[i + S..i + S + 8].copy_from_slice(&cur.to_le_bytes());
+}
+
+/// Family F: add per-pixel deltas `(d0, d0, d1, d1, d2, d2, d3, d3)`
+/// to the row pair at window index `i` over its own
+/// (motion-compensated) content.
+#[inline]
+fn add_doubled_deltas(win: &mut [u8], i: usize, d: [u8; 4]) {
+    const S: usize = STRIP_ROW_STRIDE as usize;
+    // Bytewise `(s + d) & 0x7f`: the low seven bits of a sum only
+    // depend on the low seven bits of its terms, whose sums fit their
+    // bytes.
+    let d = u64::from_le_bytes([d[0], d[0], d[1], d[1], d[2], d[2], d[3], d[3]]) & LOW7;
+    for row in [i, i + S] {
+        let px = &mut win[row..row + 8];
+        let v = u64::from_le_bytes((&*px).try_into().unwrap());
+        px.copy_from_slice(&(((v & LOW7) + d) & LOW7).to_le_bytes());
     }
+}
 
-    /// The doubled-family predictor: every other byte of the row above
-    /// (the doubled pixels' left halves).
-    #[inline]
-    fn pred_dword_doubled(&self, strip: usize, y: i64, x: u32, own: bool) -> u32 {
-        let s = &self.bufs.strips[strip];
-        let i = PlaneBuffers::idx(if own { y + 1 } else { y }, x);
-        let p: &[u8; 7] = s[i..i + 7].try_into().unwrap();
-        u32::from_le_bytes([p[0], p[2], p[4], p[6]])
+/// Predictor fill of row pairs `from..to` of an 8×8 block window;
+/// `top` marks a block at the top of the strip.
+#[inline]
+fn fill_doubled(win: &mut [u8], from: u8, to: u8, own: bool, top: bool) {
+    const S: usize = STRIP_ROW_STRIDE as usize;
+    if own {
+        // Predictor fills keep the motion-compensated content.
+        return;
     }
-
-    /// Store a decoded 4-byte row doubled horizontally as rows
-    /// `y + 1` (the row) and `y` (the average with the row above).
-    fn store_doubled(&mut self, strip: usize, y: i64, x: u32, v: u32) {
-        let b = v.to_le_bytes();
-        let mut cur = [0u8; 8];
-        for j in 0..4 {
-            cur[2 * j] = b[j];
-            cur[2 * j + 1] = b[j];
-        }
-        // The row pair's first row averages the row above with the
-        // decoded row — except at the top of the strip, where the row
-        // above is the predictor padding and the decoded row repeats
-        // (fixture-arbitrated r451 / r459: every E cell of the
-        // all-intra fixture, at the strip top and below).
-        let repeat = y == 0;
-        let s = &mut self.bufs.strips[strip];
-        let above = PlaneBuffers::idx(y - 1, x);
-        let i0 = PlaneBuffers::idx(y, x);
-        let i1 = PlaneBuffers::idx(y + 1, x);
-        let cur = u64::from_le_bytes(cur);
-        let first = if repeat {
-            cur
-        } else {
-            // Bytewise `((prev & 0x7f) + (cur & 0x7f)) >> 1`: the 7-bit
-            // sums fit their bytes, and the final mask drops the bit
-            // each byte's shift takes from the byte above it.
-            let prev = u64::from_le_bytes(s[above..above + 8].try_into().unwrap());
-            (((prev & LOW7) + (cur & LOW7)) >> 1) & LOW7
-        };
-        s[i0..i0 + 8].copy_from_slice(&first.to_le_bytes());
-        s[i1..i1 + 8].copy_from_slice(&cur.to_le_bytes());
-    }
-
-    /// Family F: add per-pixel deltas `(d0, d0, d1, d1, d2, d2, d3, d3)`
-    /// to the two rows of a pair over their own (motion-compensated)
-    /// content.
-    fn add_doubled_deltas(&mut self, strip: usize, y: i64, x: u32, d: [u8; 4]) {
-        // Bytewise `(s + d) & 0x7f`: the low seven bits of a sum only
-        // depend on the low seven bits of its terms, whose sums fit
-        // their bytes.
-        let d = u64::from_le_bytes([d[0], d[0], d[1], d[1], d[2], d[2], d[3], d[3]]) & LOW7;
-        let s = &mut self.bufs.strips[strip];
-        for row in [y, y + 1] {
-            let i = PlaneBuffers::idx(row, x);
-            let px = &mut s[i..i + 8];
-            let v = u64::from_le_bytes((&*px).try_into().unwrap());
-            px.copy_from_slice(&(((v & LOW7) + d) & LOW7).to_le_bytes());
-        }
-    }
-
-    fn fill_doubled(&mut self, strip: usize, y0: i64, x0: u32, from: u8, to: u8, own: bool) {
-        if own {
-            // Predictor fills keep the motion-compensated content.
-            return;
-        }
-        for p in from..to {
-            let y = y0 + 2 * i64::from(p);
-            let pred = self.pred_dword_doubled(strip, y - 1, x0, own);
-            self.store_doubled(strip, y, x0, pred);
-        }
+    for p in from..to {
+        let row = (2 * usize::from(p) + 1) * S;
+        let pred = read_doubled(win, row - S);
+        store_doubled(win, row, pred, top && p == 0);
     }
 }
 
@@ -1045,7 +1077,7 @@ const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 /// which fits every one of the 404 luma samples of the all-intra
 /// fixture's first frame that the plain `p + d` add misses on 64.
 /// The mechanism behind the rounding is not in the spec (docs ask).
-#[inline]
+#[cfg(test)]
 fn apply_dyad(pred: u16, dyad: u16) -> u16 {
     let a = i32::from((dyad & 0xff) as u8 as i8);
     let mut b = i32::from((dyad >> 8) as u8 as i8);
@@ -1057,6 +1089,22 @@ fn apply_dyad(pred: u16, dyad: u16) -> u16 {
     let o0 = (p0 + a) & 0xff;
     let o1 = (p1 + b) & 0xff;
     ((o1 << 8) | o0) as u16
+}
+
+/// [`apply_dyad`] on both lanes of a predictor word at once: lane `k`
+/// of `dyads` applies to bytes `2k` and `2k + 1` of `pred`.
+///
+/// Per lane, `(p0 + a) & 0xff` and `(p1 + b + (a < 0)) & 0xff` only
+/// need the raw bytes mod 256, so the low byte's sign bit is first
+/// added into the high byte of its lane, and then all four bytes are
+/// added without carries between them: the low seven bits of each
+/// byte add in place and the top bits combine by xor.
+#[inline]
+fn apply_dyads(pred: u32, dyads: u32) -> u32 {
+    let byte_add =
+        |x: u32, y: u32| ((x & 0x7f7f_7f7f) + (y & 0x7f7f_7f7f)) ^ ((x ^ y) & 0x8080_8080);
+    let borrow = (dyads & 0x0080_0080) << 1;
+    byte_add(pred, byte_add(dyads, borrow))
 }
 
 /// `spec/06 §4.4` counter byte: `(fill positions, mark positions)`.
@@ -1107,4 +1155,35 @@ pub fn decode_plane(
     }
     let _ = width;
     Ok(stats)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_dyads_matches_apply_dyad_per_lane() {
+        // Every predictor byte against every dyad byte, at each of the
+        // four byte positions, with pseudo-random other bytes.
+        let mut seed = 0x1234_5678u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for shift in [0, 8, 16, 24] {
+            for p in 0..=255u32 {
+                for d in 0..=255u32 {
+                    let mask = !(0xffu32 << shift);
+                    let pred = (next() & mask) | (p << shift);
+                    let dyads = (next() & mask) | (d << shift);
+                    let lo = apply_dyad(pred as u16, dyads as u16);
+                    let hi = apply_dyad((pred >> 16) as u16, (dyads >> 16) as u16);
+                    let want = (u32::from(hi) << 16) | u32::from(lo);
+                    assert_eq!(apply_dyads(pred, dyads), want, "{pred:08x} {dyads:08x}");
+                }
+            }
+        }
+    }
 }
