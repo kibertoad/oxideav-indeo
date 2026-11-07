@@ -56,23 +56,30 @@ pub struct GopTrailer {
     pub value2: u8,
     /// `value3` (3 bits).
     pub value3: u8,
-    /// `value4` (4 bits); its bit 3 is `gop_ext_flg`.
+    /// `value4` (4 bits).
     pub value4: u8,
-    /// `true` when `value4` bit 3 was set, triggering the `gop_ext`
-    /// continuation loop.
+    /// The `gop_ext_flg` bit after the 23 fixed bits: set, a
+    /// `gop_ext` continuation loop follows.
     pub gop_ext_present: bool,
 }
 
 impl GopTrailer {
-    /// Parse the §1.9 trailing block. The `gop_ext` loop reads-and-
-    /// discards 16-bit words while the high bit (`& 0x8000`) is set
-    /// (`spec/02 §1.9`).
+    /// Parse the §1.9 trailing block. It starts on a byte boundary
+    /// after the GOP header: 23 fixed bits, then the `gop_ext_flg`
+    /// bit, whose `gop_ext` loop reads-and-discards 16-bit words while
+    /// the high bit (`& 0x8000`) is set (`spec/02 §1.9`). This is the
+    /// layout FFmpeg's `indeo5` decoder reads (`decode_gop_header`:
+    /// `align_get_bits`, `skip_bits(23)`, then the extension flag);
+    /// reading the flag as `value4`'s top bit, without the alignment,
+    /// loses the bitstream on a GOP header that ends one bit past a
+    /// byte boundary.
     fn parse(r: &mut BitReader<'_>) -> Result<Self, FrameError> {
+        r.align()?;
         let value1 = r.read(8)? as u8;
         let value2 = r.read(8)? as u8;
         let value3 = r.read(3)? as u8;
         let value4 = r.read(4)? as u8;
-        let gop_ext_present = value4 & 0x8 != 0;
+        let gop_ext_present = r.read_bit()? != 0;
         if gop_ext_present {
             // do { word = read(16) } while (word & 0x8000)
             loop {
@@ -423,13 +430,14 @@ mod tests {
 
     #[test]
     fn parse_gop_trailer_with_ext() {
-        // value4 bit3 set -> gop_ext loop. Two words: first 0x8001
+        // gop_ext_flg set -> gop_ext loop. Two words: first 0x8001
         // (continue), second 0x0002 (stop).
         let mut w = BitWriter::new();
         w.put(0, 8); // value1
         w.put(0, 8); // value2
         w.put(0, 3); // value3
-        w.put(0x8, 4); // value4 with bit3 -> gop_ext_flg
+        w.put(0x8, 4); // value4
+        w.put(1, 1); // gop_ext_flg
         w.put(0x8001, 16); // word, high bit set -> continue
         w.put(0x0002, 16); // word, high bit clear -> stop
         w.align();
@@ -438,6 +446,40 @@ mod tests {
         let bytes = w.finish();
         let mut r = BitReader::new(&bytes).unwrap();
         let fh = FrameHeader::parse(&mut r, true).unwrap();
-        assert!(fh.gop_trailer.unwrap().gop_ext_present);
+        let tr = fh.gop_trailer.unwrap();
+        assert!(tr.gop_ext_present);
+        assert_eq!(tr.value4, 0x8);
+        // The two words and the frame header were consumed.
+        assert_eq!(r.byte_pos(), 9);
+    }
+
+    #[test]
+    fn gop_trailer_starts_on_a_byte_boundary() {
+        // A GOP header ending one bit past a byte boundary: the
+        // trailer starts at the next byte, so its 24 bits end on one
+        // and the frame header follows without further padding.
+        let mut w = BitWriter::new();
+        w.put(1, 1); // last bit of the GOP header
+        w.align();
+        w.put(0xaa, 8); // value1
+        w.put(0x55, 8); // value2
+        w.put(5, 3); // value3
+        w.put(9, 4); // value4
+        w.put(0, 1); // gop_ext_flg
+        w.put(0x10, 8); // frame_flags: checksum present
+        w.put(0xbeef, 16); // frm_checksum
+        w.put(0, 3); // value5
+        let bytes = w.finish();
+        let mut r = BitReader::new(&bytes).unwrap();
+        r.read(1).unwrap();
+        let fh = FrameHeader::parse(&mut r, true).unwrap();
+        let tr = fh.gop_trailer.unwrap();
+        assert_eq!(
+            (tr.value1, tr.value2, tr.value3, tr.value4),
+            (0xaa, 0x55, 5, 9)
+        );
+        assert!(!tr.gop_ext_present);
+        assert_eq!(fh.flags.raw, 0x10);
+        assert_eq!(fh.frm_checksum, Some(0xbeef));
     }
 }
