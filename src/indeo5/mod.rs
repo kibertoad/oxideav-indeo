@@ -50,6 +50,7 @@ pub mod pic_size;
 mod picture;
 mod planes;
 mod quant;
+mod reconstruct;
 mod refbuf;
 pub mod registry;
 mod rv_table;

@@ -6,6 +6,17 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- indeo5: a custom picture size (`pic_size_id` 15) is read height
+  first, then width, as the bitstream codes it
+- indeo5: the GOP trailer starts on a byte boundary and carries the
+  extension flag as its own bit after the 23 fixed bits
+- indeo5: band reconstruction rewritten after FFmpeg's `indeo5`
+  decoder; four-band luma, inter residuals, motion vector inheritance,
+  vectors into the band padding and droppable frames now decode, and
+  the output matches FFmpeg's on every frame of the streams checked
+
 ### Changed
 
 - indeo3: about 4x faster picture decode with identical output; criterion

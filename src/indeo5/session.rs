@@ -5,41 +5,30 @@
 //!
 //! [`Indeo5Decoder`] carries the inter-frame state a single-frame call
 //! cannot: the GOP header from the last INTRA frame (INTER frames
-//! carry no GOP, `spec/01 §3.5`), the previous frame's per-band
-//! coefficient buffers (the `spec/07 §1.2` reference workspace the
-//! band-coefficient-layer predictor reads), the previous
-//! `frame_number` (the `spec/01 §3.4` duplicate-number NULL
-//! soft-correction), and the held host buffer a NULL frame re-emits
-//! (`spec/08 §6.4`).
+//! carry no GOP, `spec/01 §3.5`), the band buffers of
+//! [`super::reconstruct::BandState`], the previous `frame_number`
+//! (the `spec/01 §3.4` duplicate-number NULL soft-correction), and
+//! the held host buffer a NULL frame re-emits (`spec/08 §6.4`).
 //!
-//! Per-frame reference-promotion follows the `spec/08 §8.1` rotation
-//! table ([`super::reference_rotation`]): INTRA / INTER promote the
-//! just-decoded band buffers to the reference; DROPPABLE_INTER_SCAL
-//! promotes with the chroma-pair swap; DROPPABLE_INTER and NULL do
-//! not promote (`spec/07 §1.5` — no later frame references a
-//! droppable frame). The [`super::RefSlots`] token model mirrors the
+//! Each band keeps three buffers, rotated per frame type as FFmpeg's
+//! `switch_buffers` does: INTRA and INTER frames become the reference
+//! of the next frame, a DROPPABLE_INTER_SCAL frame goes to a third
+//! buffer that the next DROPPABLE_INTER_SCAL frame predicts from, and
+//! DROPPABLE_INTER and NULL frames are referenced by no later frame. The [`super::RefSlots`] token model mirrors the
 //! `spec/07 §1.2`/`§1.3` slot dispatches alongside.
-//!
-//! The reachable decode subset is the structural one documented in
-//! [`super::decode_intra_picture`]: coded-block coefficient data and
-//! preset-codebook VLC fields surface as
-//! [`DecodeFrontier`](super::DecodeFrontier) records rather than
-//! pixels; the motion-compensated predictor copy (skip-inherited and
-//! explicitly-decoded MVs over the band-coefficient layer) is real.
 
 use super::ChecksumStatus;
 use super::decode::{
     BandReconstruction, DecodeError, DecodeFrontier, DecodeStats, decode_payload, output_format,
     reconstruction_checksums,
 };
-use super::finalise::{ReferenceRotation, reference_rotation};
 use super::format::OutputFormat;
 use super::gop::GopHeader;
 use super::header::FrameType;
 use super::pack::HostBuffer;
 use super::picture::{PictureError, PictureHeader};
+use super::reconstruct::BandState;
 use super::refbuf::RefSlots;
-use super::wavelet::Band;
 use super::{AssembleError, assemble_frame};
 
 /// Errors raised by the multi-frame session.
@@ -127,9 +116,9 @@ pub struct Indeo5Decoder {
     gop: Option<GopHeader>,
     /// Previous frame number (`spec/01 §3.4` soft-correction input).
     prev_frame_number: Option<u8>,
-    /// The reference per-plane per-band coefficient buffers
-    /// (`spec/07 §1.2`).
-    reference: Vec<Vec<Band>>,
+    /// The band buffers, macroblock parameters and buffer rotation
+    /// that carry from frame to frame.
+    state: BandState,
     /// The last emitted output (NULL frames re-emit it).
     held: Option<(OutputFormat, HostBuffer)>,
     /// The `spec/07 §1.2`/`§1.3` buffer-slot rotation model.
@@ -160,121 +149,77 @@ impl Indeo5Decoder {
 
         self.slots.pre_decode(frame_type);
 
-        let out = match frame_type {
-            FrameType::Null => {
-                // spec/08 §6.4 — no coded payload; re-emit the held
-                // output. The first-frame gate guarantees a held
-                // buffer exists.
-                let (format, buffer) = self
-                    .held
+        let out = if frame_type == FrameType::Null {
+            // spec/08 §6.4 — no coded payload; re-emit the held
+            // output. The first-frame gate guarantees a held GOP; a
+            // held buffer exists unless every frame so far failed.
+            self.state.null_frame();
+            let g = self
+                .gop
+                .as_ref()
+                .expect("first-frame gate guarantees a held GOP");
+            let dimensions = (g.width, g.height);
+            let (format, buffer) =
+                self.held
                     .clone()
-                    .expect("first-frame gate guarantees a held output");
-                let g = self
-                    .gop
-                    .as_ref()
-                    .expect("first-frame gate guarantees a held GOP");
-                SessionOutput {
-                    frame_type,
-                    repeated_previous: true,
-                    format,
-                    dimensions: (g.width, g.height),
-                    output: buffer,
-                    frontiers: Vec::new(),
-                    stats: DecodeStats::default(),
-                    bands: Vec::new(),
-                    frame_checksum: ChecksumStatus::Absent,
-                    parse_complete: true,
-                }
+                    .ok_or(SessionError::Decode(DecodeError::NotIntra {
+                        found: frame_type,
+                    }))?;
+            SessionOutput {
+                frame_type,
+                repeated_previous: true,
+                format,
+                dimensions,
+                output: buffer,
+                frontiers: Vec::new(),
+                stats: DecodeStats::default(),
+                bands: Vec::new(),
+                frame_checksum: ChecksumStatus::Absent,
+                parse_complete: true,
             }
-            FrameType::Intra => {
-                let gop = header.gop.clone().expect("INTRA carries a GOP");
-                let frame = header.frame.as_ref().expect("INTRA carries a frame header");
-                let payload = decode_payload(&mut r, &gop, frame, None)?;
-                let format = output_format(&gop);
-                let output = assemble_frame(
-                    &payload.recon[0],
-                    &payload.recon[1],
-                    &payload.recon[2],
-                    format,
-                )?;
-                let dimensions = (gop.width, gop.height);
-                let (bands, frame_checksum) =
-                    reconstruction_checksums(&output, frame.frm_checksum, &payload.blocks);
-                self.gop = Some(gop);
-                self.promote(frame_type, payload.bands);
-                self.held = Some((format, output.clone()));
-                SessionOutput {
-                    frame_type,
-                    repeated_previous: false,
-                    format,
-                    dimensions,
-                    output,
-                    frontiers: payload.frontiers,
-                    stats: payload.stats,
-                    bands,
-                    frame_checksum,
-                    parse_complete: payload.parse_complete,
-                }
+        } else {
+            if let Some(gop) = &header.gop {
+                // An INTRA frame's GOP governs the frames after it,
+                // even when this frame then fails to decode.
+                self.gop = Some(gop.clone());
             }
-            FrameType::Inter | FrameType::DroppableInter | FrameType::DroppableInterScalability => {
-                let gop = self.gop.clone().expect("first-frame gate held a GOP");
-                let frame = header
-                    .frame
-                    .as_ref()
-                    .expect("predicted frame carries a frame header");
-                let payload = decode_payload(&mut r, &gop, frame, Some(&self.reference))?;
-                let format = output_format(&gop);
-                let output = assemble_frame(
-                    &payload.recon[0],
-                    &payload.recon[1],
-                    &payload.recon[2],
-                    format,
-                )?;
-                let dimensions = (gop.width, gop.height);
-                let (bands, frame_checksum) =
-                    reconstruction_checksums(&output, frame.frm_checksum, &payload.blocks);
-                self.promote(frame_type, payload.bands);
-                self.held = Some((format, output.clone()));
-                SessionOutput {
-                    frame_type,
-                    repeated_previous: false,
-                    format,
-                    dimensions,
-                    output,
-                    frontiers: payload.frontiers,
-                    stats: payload.stats,
-                    bands,
-                    frame_checksum,
-                    parse_complete: payload.parse_complete,
-                }
+            let gop = self.gop.clone().expect("first-frame gate held a GOP");
+            let frame = header
+                .frame
+                .as_ref()
+                .expect("a picture-carrying frame has a frame header");
+            let payload = decode_payload(&mut r, &gop, frame_type, frame, &mut self.state)?;
+            let format = output_format(&gop);
+            let output = assemble_frame(
+                &payload.recon[0],
+                &payload.recon[1],
+                &payload.recon[2],
+                format,
+            )?;
+            let (bands, frame_checksum) = reconstruction_checksums(
+                &output,
+                frame.frm_checksum,
+                &payload.blocks,
+                &payload.band_sums,
+            );
+            self.held = Some((format, output.clone()));
+            SessionOutput {
+                frame_type,
+                repeated_previous: false,
+                format,
+                dimensions: (gop.width, gop.height),
+                output,
+                frontiers: payload.frontiers,
+                stats: payload.stats,
+                bands,
+                frame_checksum,
+                parse_complete: payload.parse_complete,
             }
         };
 
         self.slots.post_decode(frame_type);
         self.prev_frame_number = Some(header.start.frame_number);
         Ok(out)
-    }
-
-    /// Apply the `spec/08 §8.1` reference-promotion decision to the
-    /// just-decoded band buffers.
-    fn promote(&mut self, frame_type: FrameType, mut bands: Vec<Vec<Band>>) {
-        match reference_rotation(frame_type) {
-            ReferenceRotation::Promote => {
-                self.reference = bands;
-            }
-            ReferenceRotation::PromoteWithChromaSwap => {
-                // spec/08 §8.1 — swap the chroma-plane pair, then
-                // promote (the DROPPABLE_INTER_SCAL path).
-                if bands.len() == 3 {
-                    bands.swap(1, 2);
-                }
-                self.reference = bands;
-            }
-            ReferenceRotation::NoPromote => {
-                // spec/07 §1.5 droppable invariant / NULL: the
-                // reference is untouched.
-            }
-        }
     }
 }
 
@@ -332,7 +277,8 @@ mod tests {
         w.put(0x00, 8); // gop_flags
         w.put(0, 3); // decomp
         w.put(15, 4); // pic_size_id = custom
-        w.put((dim << 13) | dim, 26); // height, width
+        w.put(dim, 13); // height
+        w.put(dim, 13); // width
         w.put(0b000000, 6); // luma band_info
         w.put(0b000000, 6); // chroma band_info
         w.put(0, 8); // GOP trailer
@@ -485,7 +431,7 @@ mod tests {
 
         // INTER: the frame header carries the custom mb_huff_desc
         // (frame_flags bit 6); a 16x16 MB grid; MBs 0..254 skipped,
-        // MB 255 (at 240,240) coded with CBP 0 + MV deltas.
+        // MB 255 (at 240,240) an inter MB with CBP 0 + MV deltas.
         // src = 240 - 121 = 119: in-bounds.
         let mut w = BitWriter::new();
         w.put(0x1f, 5);
@@ -508,8 +454,9 @@ mod tests {
         for _ in 0..255 {
             w.put(1, 1);
         }
-        // MB 255: coded; CBP first, then the MV VLC pair (x, y).
+        // MB 255: not empty, inter, CBP, then the MV VLC pair (y, x).
         w.put(0, 1);
+        w.put(1, 1); // mb_type: inter
         w.put(0b0000, 4); // CBP: no AC
         let cw = cb.codeword(sym).unwrap();
         w.put_codeword(cw.code, cw.length);
@@ -528,32 +475,6 @@ mod tests {
         // Reference is all-zero, so the displaced copy is also zero:
         // output stays mid-grey — the point is the MC path decodes.
         assert!(f1.output.data.iter().all(|&b| b == 128));
-    }
-
-    #[test]
-    fn droppable_inter_does_not_promote_reference() {
-        let mut dec = Indeo5Decoder::new();
-        let mut w = BitWriter::new();
-        intra_32(&mut w, 0);
-        dec.decode(&w.finish()).expect("intra");
-        let reference_before = dec.reference.clone();
-
-        // DROPPABLE_INTER (frame_type 3), all-empty bands.
-        let mut w = BitWriter::new();
-        w.put(0x1f, 5);
-        w.put(3, 3);
-        w.put(1, 8);
-        w.put(0x00, 8);
-        w.put(0, 3);
-        w.align();
-        for _ in 0..3 {
-            w.put(0x01, 8);
-            w.align();
-        }
-        dec.decode(&w.finish()).expect("droppable");
-        // spec/07 §1.5 droppable invariant: the reference is
-        // untouched.
-        assert_eq!(dec.reference, reference_before);
     }
 
     #[test]
