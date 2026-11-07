@@ -350,10 +350,13 @@ impl GopHeader {
         // §1.6 pic_size_id (4 bits) + optional custom dimensions.
         let pic_size_id = r.read(4)?;
         let (width, height) = if pic_size_id == pic_size::PIC_SIZE_ID_CUSTOM {
-            // 26-bit read: high 13 bits = height, low 13 bits = width.
+            // Two 13-bit fields, height first, then width. The reader
+            // is LSB-first, so the height is the low 13 bits of the
+            // 26-bit read (FFmpeg's `ivi5` `decode_gop_header` reads
+            // `pic_height` before `pic_width` too).
             let combined = r.read(26)?;
-            let height = combined >> 13;
-            let width = combined & 0x1fff;
+            let height = combined & 0x1fff;
+            let width = combined >> 13;
             (width, height)
         } else {
             pic_size::lookup(pic_size_id).ok_or(GopError::ZeroPictureSize { pic_size_id })?
@@ -554,13 +557,13 @@ mod tests {
 
     #[test]
     fn parse_gop_custom_dimensions() {
-        // pic_size_id=15 -> custom: height 200, width 100.
+        // pic_size_id=15 -> custom: height 200, then width 100.
         let mut w = BitWriter::new();
         w.put(0x00, 8); // gop_flags
         w.put(0, 3); // decomp_levels = 0
         w.put(15, 4); // pic_size_id = custom
-        let combined = (200u32 << 13) | 100u32;
-        w.put(combined, 26);
+        w.put(200, 13); // height
+        w.put(100, 13); // width
         w.put(0b000000, 6); // luma band
         w.put(0b000000, 6); // chroma band
         let bytes = w.finish();

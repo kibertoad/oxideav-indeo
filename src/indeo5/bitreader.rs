@@ -349,17 +349,17 @@ mod tests {
 
     #[test]
     fn twenty_six_bit_split_pair() {
-        // spec/02 §1.6 custom dimensions: 26-bit read, high 13 = height,
-        // low 13 = width. Build height=200, width=100.
-        // value = (height << 13) | width, emitted LSB-first.
+        // spec/02 §1.6 custom dimensions: one 26-bit read of two 13-bit
+        // fields, height first. LSB-first, the first field is the low
+        // 13 bits. Build height=200, width=100.
         let height = 200u32;
         let width = 100u32;
-        let value = (height << 13) | width;
+        let value = (width << 13) | height;
         let mut bytes = value.to_le_bytes().to_vec();
         bytes.extend_from_slice(&[0, 0, 0, 0]);
         let mut r = BitReader::new(&bytes).unwrap();
         let combined = r.read(26).unwrap();
-        assert_eq!(combined & 0x1fff, width);
-        assert_eq!(combined >> 13, height);
+        assert_eq!(combined & 0x1fff, height);
+        assert_eq!(combined >> 13, width);
     }
 }
