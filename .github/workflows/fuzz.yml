@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [indeo5_intra, indeo5_session, indeo3_picture]
+        target: [indeo5_decoder, indeo3_picture]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

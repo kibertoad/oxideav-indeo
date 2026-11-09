@@ -1,30 +1,15 @@
 //! Indeo 5 (`IV50`) codec-registry integration: the [`oxideav_core`]
-//! [`Decoder`] trait wrapper around the in-crate [`Indeo5Decoder`], plus
+//! [`Decoder`] trait wrapper around the in-crate [`Iv50Decoder`], plus
 //! the FourCC routing surface a generic container (`oxideav-avi`,
 //! `oxideav-mov`) needs to resolve an `IV50` video track to this crate.
-//!
-//! Spec source for the FourCC / output format: the `IV50` handler and
-//! the `spec/08` planar output layout under
-//! `docs/video/indeo/indeo5/spec/`.
-//!
-//! ## What this module adds
-//!
-//! Every other `indeo5` module is reachable only through the crate's own
-//! typed API ([`Indeo5Decoder::decode`] → [`SessionOutput`]). This module
-//! bridges that API to the framework's published codec surface so a
-//! pipeline that resolves codecs through an
-//! [`oxideav_core::CodecRegistry`] — the way the container crates do —
-//! can construct and drive an Indeo 5 decoder without naming this crate's
-//! concrete types:
 //!
 //! * [`codec_id_for_fourcc`] maps an on-wire FourCC (`IV50`,
 //!   case-insensitive) to the [`CodecId`] this crate registers.
 //! * [`Indeo5RegistryDecoder`] implements [`Decoder`]: it owns an
-//!   [`Indeo5Decoder`] (so NULL / repeat frames re-emit the previous
-//!   output, `spec/08 §6.4`), feeds each [`Packet`]'s bytes through
-//!   [`Indeo5Decoder::decode`], and shapes the [`SessionOutput`]'s
-//!   planar [`HostBuffer`](super::HostBuffer) into an
-//!   [`oxideav_core::VideoFrame`].
+//!   [`Iv50Decoder`], feeds each [`Packet`]'s bytes to
+//!   [`Iv50Decoder::decode`] and turns the decoded planes into an
+//!   [`oxideav_core::VideoFrame`]. A NULL frame repeats the previous
+//!   picture.
 //! * [`make_decoder`] is the [`oxideav_core::registry::codec::DecoderFactory`]
 //!   the registry calls; [`register_codecs`] / [`register`] install the
 //!   codec (id + caps + factory + probe + FourCC tag) into a
@@ -32,23 +17,11 @@
 //!
 //! ## Output pixel format
 //!
-//! Indeo 5's dominant output is 4:1:0 (`YVU9`): luma at full resolution,
-//! chroma subsampled 4×4 (the `Yv12` / `I420` streams are 4:2:0). The
-//! framework carries no 4:1:0 pixel format, so — exactly as the sibling
-//! Indeo 3 bridge does — this module box-upsamples both chroma planes to
-//! full luma resolution via the spec's own top-left-cosited box filter
-//! ([`upsample_chroma`], `spec/08 §3.5`/`§5.2`) and emits
-//! [`PixelFormat::Yuv444P`] (three equal-size 8-bit planes, Y/U/V order).
-//! No chroma detail is fabricated beyond that box filter.
-//!
-//! ## Scope
-//!
-//! This is a thin bridge — it adds no new decode behaviour. It emits
-//! exactly what [`Indeo5Decoder`] reconstructs: the structurally-decoded
-//! frame, whose coefficient *pixel* synthesis stays at the `spec/06`
-//! fused-transform / dequant docs-gap (uniform mid-grey where the
-//! transform is not yet staged), reshaped into the framework's
-//! `VideoFrame`.
+//! Indeo 5 decodes to 4:1:0: chroma planes a quarter of the luma size in
+//! each direction. The framework has no 4:1:0 pixel format, so each
+//! chroma sample is repeated over the 4 by 4 luma area it covers and the
+//! frame is emitted as [`PixelFormat::Yuv444P`]: three planes at the luma
+//! size, in Y, U, V order.
 
 use oxideav_core::{
     CodecCapabilities, CodecId, CodecInfo, CodecParameters, CodecRegistry, CodecTag, Decoder,
@@ -56,11 +29,7 @@ use oxideav_core::{
     VideoPlane,
 };
 
-use super::chroma::upsample_chroma;
-use super::output::OutputPlane;
-use super::picture::PictureHeader;
-use super::planes::PlaneRole;
-use super::session::{Indeo5Decoder, SessionError, SessionOutput};
+use super::decoder::{Iv50Decoder, Iv50Error, Iv50Plane, looks_like_iv50};
 
 /// The public codec id this crate registers for Indeo 5 (`"indeo5"`).
 pub const CODEC_ID_STR: &str = "indeo5";
@@ -91,8 +60,8 @@ pub fn codec_id_for_fourcc(fourcc: &[u8; 4]) -> Option<CodecId> {
 /// parameters.
 ///
 /// The parameters' `width` / `height` / `pixel_format` are advisory —
-/// the Indeo 5 bitstream carries its own dimensions in every INTRA GOP
-/// header (`spec/02 §1.6`), so the decoder is self-describing.
+/// the Indeo 5 bitstream carries its own dimensions in the GOP header of
+/// every intra frame, so the decoder is self-describing.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Indeo5RegistryDecoder::new(
         params.codec_id.clone(),
@@ -100,16 +69,15 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 }
 
 /// An [`oxideav_core`] [`Decoder`] backed by the in-crate stateful
-/// [`Indeo5Decoder`].
+/// [`Iv50Decoder`].
 ///
-/// Holds the multi-frame session (NULL / repeat frames re-emit the
-/// previous output per `spec/08 §6.4`; INTER frames predict against the
-/// held reference) and a single-packet pending slot. `send_packet`
-/// stashes the packet; `receive_frame` decodes it and shapes the
-/// [`SessionOutput`] into a [`PixelFormat::Yuv444P`] [`VideoFrame`].
+/// Holds the decoder, whose state spans frames, and a single-packet
+/// pending slot. `send_packet` stashes the packet; `receive_frame`
+/// decodes it and returns the picture as a [`PixelFormat::Yuv444P`]
+/// [`VideoFrame`].
 pub struct Indeo5RegistryDecoder {
     codec_id: CodecId,
-    inner: Indeo5Decoder,
+    inner: Iv50Decoder,
     pending: Option<Packet>,
     eof: bool,
 }
@@ -119,102 +87,72 @@ impl Indeo5RegistryDecoder {
     pub fn new(codec_id: CodecId) -> Self {
         Indeo5RegistryDecoder {
             codec_id,
-            inner: Indeo5Decoder::new(),
+            inner: Iv50Decoder::new(),
             pending: None,
             eof: false,
         }
     }
 }
 
-/// Map an Indeo 5 [`SessionError`] into the framework [`Error`] surface.
-///
-/// A session-level rejection (first-frame must be INTRA) and any
-/// structural / reconstruction fault both mean "this packet's bytes are
-/// not a decodable Indeo 5 frame in this stream position", so both
-/// surface as [`Error::invalid`].
-fn map_session_error(e: SessionError) -> Error {
+/// Map an [`Iv50Error`] into the framework [`Error`] surface. Every
+/// decode error means the packet is not a decodable IV50 frame at this
+/// point of the stream.
+fn map_decode_error(e: Iv50Error) -> Error {
     Error::invalid(format!("indeo5: {e}"))
 }
 
-/// Shape an Indeo 5 [`SessionOutput`] (a planar host buffer at the
-/// stream's native subsampling) into an [`oxideav_core`] [`VideoFrame`]
-/// in [`PixelFormat::Yuv444P`] plane order (Y, U, V).
-///
-/// The host buffer carries the three planes tightly packed at their
-/// native resolutions (`spec/08 §5.3`); this unpacks them by role, box-
-/// upsamples the two chroma planes to full luma resolution (`spec/08
-/// §3.5`), and lays them out as three equal-size 8-bit planes.
-///
-/// Returns [`Error::invalid`] for the packed (`Yuy2`) / RGB output
-/// formats — those are not planar concatenations and their conversion is
-/// a `spec/08 §9` docs-gap. The staged INTRA/INTER decode path only ever
-/// produces the planar `Yvu9` / `Yv12` / `I420` formats.
-fn session_output_to_video_frame(out: &SessionOutput, pts: Option<i64>) -> Result<VideoFrame> {
-    let (lw, lh) = out.dimensions;
-    let Some(subsampling) = out.format.subsampling() else {
-        return Err(Error::invalid(
-            "indeo5: non-planar output format (Yuy2/RGB) is a spec/08 §9 docs-gap",
-        ));
-    };
-    let (cw, ch) = subsampling.chroma_dims(lw, lh);
+/// Repeat each chroma sample over the 4 by 4 luma pixels it covers,
+/// giving a plane of `width` by `height`. Luma pixel (x, y) takes chroma
+/// sample (x / 4, y / 4): the chroma planes are `ceil(width / 4)` by
+/// `ceil(height / 4)` ([`Iv50Decoder`] refuses half-size chroma).
+fn upsample(p: &Iv50Plane, width: usize, height: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(width * height);
+    for y in 0..height {
+        let row = p.row((y / 4).min(p.height - 1));
+        out.extend((0..width).map(|x| row[(x / 4).min(p.width - 1)]));
+    }
+    out
+}
 
-    let luma = OutputPlane {
-        width: lw,
-        height: lh,
-        pixels: out.output.plane_bytes(PlaneRole::Luma).to_vec(),
+/// The decoder's current picture as a [`PixelFormat::Yuv444P`]
+/// [`VideoFrame`] (Y, U, V, each at the luma size).
+fn picture_to_video_frame(dec: &Iv50Decoder, pts: Option<i64>) -> Result<VideoFrame> {
+    let (Some(y), Some(u), Some(v)) = (dec.y(), dec.u(), dec.v()) else {
+        return Err(Error::invalid("indeo5: no picture decoded yet"));
     };
-    let u_sub = OutputPlane {
-        width: cw,
-        height: ch,
-        pixels: out.output.plane_bytes(PlaneRole::ChromaU).to_vec(),
-    };
-    let v_sub = OutputPlane {
-        width: cw,
-        height: ch,
-        pixels: out.output.plane_bytes(PlaneRole::ChromaV).to_vec(),
-    };
-
-    let u = upsample_chroma(&u_sub, subsampling, lw, lh)
-        .ok_or_else(|| Error::invalid("indeo5: chroma-U upsample dimension mismatch"))?;
-    let v = upsample_chroma(&v_sub, subsampling, lw, lh)
-        .ok_or_else(|| Error::invalid("indeo5: chroma-V upsample dimension mismatch"))?;
-
-    let stride = lw as usize;
+    let (w, h) = (y.width, y.height);
+    let luma: Vec<u8> = (0..h).flat_map(|r| y.row(r).iter().copied()).collect();
     let planes = vec![
         VideoPlane {
-            stride,
-            data: luma.pixels,
+            stride: w,
+            data: luma,
         },
         VideoPlane {
-            stride,
-            data: u.pixels,
+            stride: w,
+            data: upsample(&u, w, h),
         },
         VideoPlane {
-            stride,
-            data: v.pixels,
+            stride: w,
+            data: upsample(&v, w, h),
         },
     ];
     Ok(VideoFrame { pts, planes })
 }
 
-/// One-shot direct decode: decode a single Indeo 5 codec frame's bytes
-/// into an [`oxideav_core`] [`VideoFrame`] in [`PixelFormat::Yuv444P`]
-/// (Y, U, V) without managing a [`Decoder`] state machine.
+/// One-shot direct decode: decode a single Indeo 5 frame's bytes into an
+/// [`oxideav_core`] [`VideoFrame`] in [`PixelFormat::Yuv444P`] (Y, U, V)
+/// without managing a [`Decoder`] state machine.
 ///
-/// This is the direct-API counterpart to the registry path, mirroring
-/// the convention sibling codec crates follow. It builds a fresh
-/// [`Indeo5Decoder`] and decodes `data` as the **first** frame; because
-/// the session starts empty, `data` must be an INTRA frame (the `spec/01
-/// §3.2` first-frame gate) — a non-INTRA first frame returns
-/// [`Error::invalid`]. Callers decoding a *sequence* (where NULL-repeat
-/// and the reference-bank rotation matter) want the stateful
-/// [`Indeo5RegistryDecoder`] / [`Indeo5Decoder`] instead.
+/// It decodes `data` with a fresh [`Iv50Decoder`], so `data` must be an
+/// intra frame; any other frame returns [`Error::invalid`]. Callers
+/// decoding a sequence want [`Indeo5RegistryDecoder`] or
+/// [`Iv50Decoder`] instead.
 ///
 /// `pts` is carried straight onto the returned frame.
 pub fn decode_video_frame(data: &[u8], pts: Option<i64>) -> Result<VideoFrame> {
-    let mut decoder = Indeo5Decoder::new();
-    let out = decoder.decode(data).map_err(map_session_error)?;
-    session_output_to_video_frame(&out, pts)
+    let mut decoder = Iv50Decoder::new();
+    decoder.decode(data).map_err(map_decode_error)?;
+    picture_to_video_frame(&decoder, pts)
 }
 
 impl Decoder for Indeo5RegistryDecoder {
@@ -240,8 +178,8 @@ impl Decoder for Indeo5RegistryDecoder {
                 Err(Error::NeedMore)
             };
         };
-        let out = self.inner.decode(&pkt.data).map_err(map_session_error)?;
-        Ok(Frame::Video(session_output_to_video_frame(&out, pkt.pts)?))
+        self.inner.decode(&pkt.data).map_err(map_decode_error)?;
+        Ok(Frame::Video(picture_to_video_frame(&self.inner, pkt.pts)?))
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -251,18 +189,17 @@ impl Decoder for Indeo5RegistryDecoder {
 
     fn reset(&mut self) -> Result<()> {
         // A container seek restarts the Indeo 5 inter-frame state: drop
-        // the pending packet and the held session so the next packet
-        // decodes as a fresh INTRA frame (the `spec/01 §3.2` first-frame
-        // gate).
+        // the pending packet and the decoder, so the next packet must be
+        // an intra frame.
         self.pending = None;
         self.eof = false;
-        self.inner = Indeo5Decoder::new();
+        self.inner = Iv50Decoder::new();
         Ok(())
     }
 }
 
-/// Confidence [`probe`] returns when a first packet parses as a genuine
-/// Indeo 5 picture header (PSC + frame-type + dimensions all validate).
+/// Confidence [`probe`] returns when a first packet starts with valid
+/// Indeo 5 headers.
 pub const PROBE_CONFIDENCE_HEADER_OK: f32 = 1.0;
 
 /// Confidence [`probe`] returns when no first-packet bytes are available
@@ -273,24 +210,25 @@ pub const PROBE_CONFIDENCE_TAG_ONLY: f32 = 0.6;
 /// The [`oxideav_core::ProbeFn`] for Indeo 5 tag disambiguation.
 ///
 /// When the demuxer has peeked a first packet ([`ProbeContext::packet`]
-/// is `Some`), parse the `spec/01 §3` picture-start header (PSC `0x1f`,
-/// frame type, and — for INTRA — the GOP dimensions):
+/// is `Some`), parse its picture start (start code 0x1f and a frame type
+/// of 0 to 4), and for an intra frame its GOP header (subsampling code,
+/// picture size, band layout) and frame header:
 ///
-/// * a structurally-valid picture header → [`PROBE_CONFIDENCE_HEADER_OK`];
-/// * a packet present but whose header fails to parse → `0.0`
-///   ("not me" — lets a colliding FourCC claimant win on genuinely
-///   non-Indeo-5 bytes);
-/// * no packet available → [`PROBE_CONFIDENCE_TAG_ONLY`].
+/// * headers that parse give [`PROBE_CONFIDENCE_HEADER_OK`], also when
+///   they ask for a feature the decoder doesn't support;
+/// * a packet whose headers don't parse gives `0.0`, so another claimant
+///   of the FourCC can win on bytes that aren't Indeo 5;
+/// * no packet gives [`PROBE_CONFIDENCE_TAG_ONLY`].
 ///
-/// The probe reads only the fixed header bits, never the coefficient
-/// stream, so it stays cheap and touches no docs-gapped table.
+/// The probe reads only the headers, never the band data.
 pub fn probe(ctx: &ProbeContext) -> f32 {
     let Some(bytes) = ctx.packet else {
         return PROBE_CONFIDENCE_TAG_ONLY;
     };
-    match PictureHeader::parse(bytes, None) {
-        Ok(_) => PROBE_CONFIDENCE_HEADER_OK,
-        Err(_) => 0.0,
+    if looks_like_iv50(bytes) {
+        PROBE_CONFIDENCE_HEADER_OK
+    } else {
+        0.0
     }
 }
 
@@ -298,10 +236,9 @@ pub fn probe(ctx: &ProbeContext) -> f32 {
 /// the `IV50` FourCC tag) into a [`CodecRegistry`].
 ///
 /// The capabilities advertise the lossy video codec emitting
-/// [`PixelFormat::Yuv444P`] (the full-luma-resolution surface the
-/// registry decoder produces after the `spec/08 §3.5` chroma box
-/// upsample). No encoder is registered — this crate is a decoder-only
-/// clean-room rebuild.
+/// [`PixelFormat::Yuv444P`] (the registry decoder repeats each chroma
+/// sample over its 4 by 4 luma pixels). No encoder is registered: the
+/// crate only decodes.
 pub fn register_codecs(reg: &mut CodecRegistry) {
     let caps = CodecCapabilities::video("indeo5_sw")
         .with_lossy(true)
@@ -325,6 +262,24 @@ pub fn register(ctx: &mut RuntimeContext) {
 mod tests {
     use super::*;
     use oxideav_core::stream::CodecResolver;
+
+    #[test]
+    fn chroma_sample_covers_four_by_four_luma_pixels() {
+        // A 9 by 5 picture has 3 by 2 chroma samples; luma column x takes
+        // chroma column x / 4, also when 9 / 3 would suggest a factor of 3.
+        let data: Vec<u8> = (0..2 * 32)
+            .map(|i| (i % 32) as u8 + 10 * (i / 32) as u8)
+            .collect();
+        let p = Iv50Plane {
+            width: 3,
+            height: 2,
+            stride: 32,
+            data: &data,
+        };
+        let up = upsample(&p, 9, 5);
+        assert_eq!(&up[..9], &[0, 0, 0, 0, 1, 1, 1, 1, 2]);
+        assert_eq!(&up[4 * 9..], &[10, 10, 10, 10, 11, 11, 11, 11, 12]);
+    }
 
     #[test]
     fn codec_id_for_fourcc_maps_iv50() {
@@ -398,6 +353,30 @@ mod tests {
         let junk = [0u8; 4];
         let ctx = ProbeContext::new(&tag).packet(&junk);
         assert_eq!(probe(&ctx), 0.0);
+    }
+
+    #[test]
+    fn probe_accepts_real_frames_and_refuses_bad_headers() {
+        let tag = CodecTag::fourcc(b"IV50");
+        let frame: &[u8] = include_bytes!("../../tests/data/intra-320x240-indeo5.iv50");
+        assert_eq!(
+            probe(&ProbeContext::new(&tag).packet(frame)),
+            PROBE_CONFIDENCE_HEADER_OK
+        );
+        // A predicted frame: picture start (type 1) and a frame header.
+        let inter = [0x1f | (1 << 5), 7, 0x80, 0];
+        assert_eq!(
+            probe(&ProbeContext::new(&tag).packet(&inter)),
+            PROBE_CONFIDENCE_HEADER_OK
+        );
+        // Frame type 5 and an intra frame whose subsampling code is 3.
+        let bad_type = [0x1f | (5 << 5), 0, 0, 0];
+        assert_eq!(probe(&ProbeContext::new(&tag).packet(&bad_type)), 0.0);
+        // The fixture's gop_flags (byte 2) carry a 16-bit header size,
+        // so the subsampling code is in bits 0..2 of byte 5.
+        let mut bad_sub = frame.to_vec();
+        bad_sub[5] = (bad_sub[5] & !7) | 3;
+        assert_eq!(probe(&ProbeContext::new(&tag).packet(&bad_sub)), 0.0);
     }
 
     #[test]

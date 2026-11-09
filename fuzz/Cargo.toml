@@ -15,15 +15,8 @@ libfuzzer-sys = "0.4"
 path = ".."
 
 [[bin]]
-name = "indeo5_intra"
-path = "fuzz_targets/indeo5_intra.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "indeo5_session"
-path = "fuzz_targets/indeo5_session.rs"
+name = "indeo5_decoder"
+path = "fuzz_targets/indeo5_decoder.rs"
 test = false
 doc = false
 bench = false

@@ -25,7 +25,7 @@ decoder reproduces `Y=16, U=V=128` for it); the 320x240 frame carries
 decodes (the vendor decoder's packed `YUY2` host buffer, `Y0 U Y1 V`
 per 4-byte unit, `width*height*2` bytes; chroma at 4:2:2 as the
 vendor's own writer upsamples it). Luma is compared sample-for-sample
-in `tests/indeo5_pixels.rs`.
+in `tests/indeo5_decoder.rs`.
 
 | File | Bytes | SHA-256 |
 | ---- | ----- | ------- |
@@ -35,7 +35,7 @@ in `tests/indeo5_pixels.rs`.
 `iv50-quant-matrices-1007b000.csv` is the staged regenerated runtime
 quantiser bank (`docs/video/indeo/indeo5/tables/quant_matrices_1007b000.csv`,
 Extractor round 15, live-verified in Validator round 16), the oracle
-for `tests/indeo5_quant_tables.rs`.
+for the quantiser bank test in `src/indeo5/decoder/band.rs`.
 
 ## `iv32-160x120-all-intra/` / `iv32-176x144-4frame-intra-period/`
 

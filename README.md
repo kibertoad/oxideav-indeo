@@ -16,7 +16,7 @@ staged under `docs/video/indeo/`:
 | Codec | FourCC | State |
 | ----- | ------ | ----- |
 | Indeo 3 | `IV31` / `IV32` | **Decodes.** Both staged corpora (160×120 all-intra, 176×144 with a 4-frame intra period) reproduce the reference decode **pixel-exact on every frame and every plane** — 16 / 16 frames: intra (families A / E), inter (motion compensation with full- and half-pel vectors, families B / F), VQ_NULL cells, NULL-frame repeat, the two-bank reference ping-pong. |
-| Indeo 5 | `IV50` | **Intra decodes.** Both staged fixtures (240×180 flat, 320×240 quantised) reproduce the vendor's `YUY2` host buffer **byte-exact** (luma pixel-exact, chroma through the vendor's cosited 2× interpolation) and verify all eight stored `spec/08 §7` checksums. INTER frames parse and motion-compensate per `spec/07` but no inter fixture is staged. |
+| Indeo 5 | `IV50` | **Decodes.** Intra, inter and NULL frames, one-band and four-band luma, transparency windows. On the 40 IV50 movies of Rent-A-Hero (5 245 frames) the 8-bit planes equal the vendor driver's on every frame of 22 movies; in the other 18, all with transparency, the only difference is one run of at most 31 luma pixels that the driver never initialises. |
 | Indeo 2 / 4 | `RT21` / `IV41` | Wiki-snapshot documentation only under `docs/video/indeo/indeoN/wiki/` (no formal `spec/`); scaffold pending docs work. |
 
 All truth is drawn from the staged spec / trace docs — no external
@@ -74,33 +74,29 @@ output).
 
 ### Indeo 5 (`IV50`)
 
-Entry points: `indeo5::Indeo5Decoder` (stateful session),
-`indeo5::decode_intra_picture` (one-shot INTRA), the `oxideav_core`
-bridge `indeo5::Indeo5RegistryDecoder` / `decode_video_frame`
-(`Yuv444P`), and `indeo5::pack_yuy2` (the vendor's packed 4:2:2 host
-buffer, byte-exact).
+Entry points: `indeo5::Iv50Decoder` (stateful; `decode(frame) ->
+FrameType`, then the `y()`, `u()` and `v()` planes) and the
+`oxideav_core` bridge `indeo5::Indeo5RegistryDecoder` /
+`decode_video_frame` (`PixelFormat::Yuv444P`, each chroma sample
+repeated over its 4×4 luma pixels).
 
-The intra path (r459) is complete against the fixtures: picture /
-GOP / band headers, the prefix-form Huffman codebooks, the rv-table
-symbol layout (`spec/05 §2.2`; the `num_rv_corr` pairs are symbol-slot
-swaps, `spec/05 §2.4`), the byte-aligned tile phases (MB headers,
-then coded-block streams — `spec/03 §4.1`), quantisation reversal by
-table (`spec/05 §2.3` / `spec/06 §5`: 288 regenerated step matrices,
-`±(k·b + ⌊b/2⌋ − (b & 1, b > 1))`), the previous-block DC chain, the
-measured 8-point inverse Slant and the `spec/08 §3.0` output rule. The
-320×240 fixture is luma pixel-exact (76 800 / 76 800) and all four of
-its stored checksums verify; the 240×180 fixture likewise; both
-reproduce the vendor's `YUY2` output byte-exact (`spec/08 §3.4`
-chroma: cosited separable 2× interpolation with truncating averages,
-horizontal pass first).
+The decoder was written from a clean-room specification of the vendor
+driver IR50_32.DLL (R.5.06.15.2.44, MMX path), with no other decoder's
+source consulted, and reproduces that driver: picture start and the
+repeated-number NULL rule, GOP, frame and band headers, the row-width
+prefix codes, macroblock headers with quantiser deltas and inherited
+vectors, run/value tables with corrections and escapes,
+dequantisation, DC prediction, the inverse Slant transforms,
+half-sample motion compensation from the rotating reference buffers,
+the driver's four-band synthesis filter, and the transparency bounding
+box that limits which part of the picture a frame rebuilds. The planes
+keep what earlier frames wrote outside that box, as the driver's do.
 
-Open (docs asks, `spec/`-cited in the round reports): the class bit of
-the quantiser pointer set (`spec/06 §5.2`, only class 1 observed), the
-selector of matrix group 1 and quantisers above 23 (`spec/06 §5.1`),
-the 4×4 quant-matrix indexing (both readings verify the checksums),
-the mechanism of the extra MB-header-width alignment (`spec/03 §4.1`),
-INTER / droppable frames (no fixture), and the 1-band writers' output
-rules (`spec/08 §3.3`).
+Refused with `Iv50Error::Unsupported` because no known stream uses them
+and their decoding isn't established: several tiles per band, half-size
+chroma, locked streams (access key), seven-band luma and four-band
+chroma, bitstream versions other than 2, and a few inheritance cases
+the driver handles in ways not yet traced.
 
 ## Selected public API
 
@@ -116,13 +112,8 @@ rules (`spec/08 §3.3`).
   layer and codec-init tables.
 - `indeo3::DecodeSession` — the inter-frame sequencer (first-frame /
   seek INTRA gate, NULL repeat, reference bank).
-- `indeo5::Indeo5Decoder::decode` → `SessionOutput`;
-  `indeo5::decode_intra_picture` → `DecodedPicture` (host buffer,
-  per-band `BandReconstruction` + `ChecksumStatus`, frame checksum);
-  `indeo5::pack_yuy2`.
-- `indeo5::quant_matrix` / `recon_value` / `dequant_level` — the
-  quantiser tables; `indeo5::RvTable`, `Codebook`, `BitReader` — the
-  entropy layer.
+- `indeo5::Iv50Decoder::decode` → `FrameType`; `y()` / `u()` / `v()`
+  → `Iv50Plane` (width, height, stride, samples); `Iv50Error`.
 - Registry: `register` (crate root), `indeo3::register_codecs` /
   `indeo5::register`, `codec_id_for_fourcc`, `probe`.
 

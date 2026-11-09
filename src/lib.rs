@@ -51,11 +51,9 @@
 //! * `07-output-reconstruction.md` — the predictor chain, strip-to-frame
 //!   assembly, chroma upsample, and §6 frame finalisation.
 //!
-//! Indeo 5 (`IV50`) has a staged clean-room spec under
-//! `docs/video/indeo/indeo5/spec/`; [`indeo5`] is bootstrapping its
-//! decode stack bottom-up (LSB-first bit reader, format descriptor,
-//! picture-start triplet, standard picture-size tables). Indeo 2 / 4
-//! have only a multimedia.cx wiki snapshot under
+//! **Indeo 5 (`IV50`)**: [`indeo5::Iv50Decoder`] decodes intra, inter
+//! and NULL frames into the same 8-bit planes as the vendor driver.
+//! Indeo 2 / 4 have only a multimedia.cx wiki snapshot under
 //! `docs/video/indeo/indeoN/wiki/`, no `spec/`, so they remain at the
 //! round-0 scaffold pending docs work.
 
