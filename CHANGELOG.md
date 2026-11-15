@@ -6,6 +6,19 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/kibertoad/oxideav-indeo/compare/v0.0.5...v0.0.6) - 2026-11-15
+
+### Other
+
+- check the four-band recombination against the 5/3 synthesis pair
+- reference chain test for every frame type; refuse unmatched half-size chroma inheritance
+- stream parameters on the registry decoder
+- decode 1.6 to 1.9 times as fast, registry bridge 2.2 to 3 times; bench and fuzz seeds
+- hostile-input tests, a picture-area bound the caller can lower
+- half-size chroma, stream parameters on the registry decoder, quantisers above 23
+- cite the staged specification, check every table against its files
+- staged inter fixture byte-exact against the vendor YUY2 output; Iv50Decoder::yuy2
+
 ### Added
 
 - indeo5: `Iv50Decoder::yuy2`, the picture as packed `YUY2` with the
