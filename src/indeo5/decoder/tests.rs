@@ -269,6 +269,7 @@ fn four_band_layout() -> PlaneLayout {
         luma_info: vec![info; 4],
         chroma_info: vec![info],
         transparency: false,
+        colour: None,
         intra_only: false,
     };
     build_layout(&gop).swap_remove(0)
@@ -433,8 +434,14 @@ fn four_band_first_column_repeats_itself() {
 }
 
 /// An intra frame like [`intra_frame`] in a stream with transparency
-/// (gop_flags bit 3), whose trailer carries `rects` as (x, y, w, h).
-fn transparent_intra_frame(rects: &[(u32, u32, u32, u32)]) -> Vec<u8> {
+/// (gop_flags bit 3) and the transparency colour `colour`, whose
+/// trailer carries `rects` as (x, y, w, h) and then whatever `rest`
+/// writes: the row-delta bit, the descriptor and the mask data.
+fn transparent_intra_frame(
+    rects: &[(u32, u32, u32, u32)],
+    colour: Option<u32>,
+    rest: impl FnOnce(&mut BitWriter),
+) -> Vec<u8> {
     let rv = RvMap::new(8, &[]).unwrap();
     let mut w = BitWriter::new();
     w.put(0x1f, 5);
@@ -446,7 +453,13 @@ fn transparent_intra_frame(rects: &[(u32, u32, u32, u32)]) -> Vec<u8> {
     w.put((16 << 13) | 8, 26);
     w.put(0, 6);
     w.put(6, 6);
-    w.put(0, 4); // transparency flags: no colour
+    match colour {
+        Some(c) => {
+            w.put(8, 4);
+            w.put(c, 24);
+        }
+        None => w.put(0, 4),
+    }
     w.align();
     w.put(2 << 19, 24);
     w.align();
@@ -466,8 +479,6 @@ fn transparent_intra_frame(rects: &[(u32, u32, u32, u32)]) -> Vec<u8> {
     }
     w.align();
     empty_chroma(&mut w);
-    // Trailer: rectangle count, the rectangles, mask flag, no
-    // descriptor.
     w.put(rects.len() as u32, 3);
     for &(x, y, rw, rh) in rects {
         w.put(x, 16);
@@ -475,9 +486,56 @@ fn transparent_intra_frame(rects: &[(u32, u32, u32, u32)]) -> Vec<u8> {
         w.put(rw, 16);
         w.put(rh, 16);
     }
-    w.put(0, 2);
+    rest(&mut w);
     w.align();
     w.bytes
+}
+
+/// Trailer rest: no row delta, no descriptor, a mask that is opaque
+/// everywhere.
+fn opaque_mask(w: &mut BitWriter) {
+    w.put(0, 2);
+    w.align();
+    w.put(1, 1); // one value
+    w.put(1, 1); // opaque
+}
+
+/// The descriptor the mask tests use: symbol 0 is one bit, 1 to 128 and
+/// 129 to 256 nine bits.
+const MASK_ROWS: [u8; 3] = [0, 7, 7];
+
+/// Trailer rest: row delta `delta`, the descriptor when `descriptor`,
+/// no size, the first run's value `first` and the run codes `codes`.
+fn run_mask(
+    delta: bool,
+    descriptor: bool,
+    first: u32,
+    codes: &[u32],
+) -> impl FnOnce(&mut BitWriter) {
+    let codes = codes.to_vec();
+    move |w: &mut BitWriter| {
+        w.put(delta as u32, 1);
+        w.put(descriptor as u32, 1);
+        if descriptor {
+            w.put(MASK_ROWS.len() as u32, 4);
+            for r in MASK_ROWS {
+                w.put(r as u32, 4);
+            }
+        }
+        w.align();
+        w.put(0, 1); // run-coded
+        w.put(0, 1); // no size
+        w.align();
+        w.put(first, 1);
+        for c in codes {
+            w.sym(&MASK_ROWS, c);
+        }
+    }
+}
+
+/// The mask of the current picture, one row per picture row.
+fn mask_rows(dec: &Iv50Decoder) -> Vec<Vec<u8>> {
+    rows(dec.transparency().unwrap().mask)
 }
 
 #[test]
@@ -489,12 +547,366 @@ fn transparency_rectangles_outside_the_picture_write_nothing() {
     ] {
         let mut dec = Iv50Decoder::new();
         assert_eq!(
-            dec.decode(&transparent_intra_frame(&[rect])),
+            dec.decode(&transparent_intra_frame(&[rect], None, opaque_mask)),
             Ok(FrameType::Intra)
         );
         // The window lies outside the picture, so nothing is
         // recombined and the planes keep their initial zeros.
         assert!(rows(dec.y().unwrap()).iter().flatten().all(|&v| v == 0));
+    }
+}
+
+#[test]
+fn transparency_colour_rectangles_and_single_value_masks() {
+    let mut dec = Iv50Decoder::new();
+    let f = transparent_intra_frame(&[(1, 2, 3, 4), (5, 0, 2, 2)], Some(0x563412), opaque_mask);
+    assert_eq!(dec.decode(&f), Ok(FrameType::Intra));
+    let t = dec.transparency().unwrap();
+    // Red in bits 0..7, green in 8..15, blue in 16..23.
+    assert_eq!(t.colour, Some([0x12, 0x34, 0x56]));
+    let rect = |x, y, width, height| Iv50Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    assert_eq!(t.rects, &[rect(1, 2, 3, 4), rect(5, 0, 2, 2)]);
+    // The mask covers the picture; its rows are the width rounded up to
+    // 32.
+    assert_eq!((t.mask.width, t.mask.height, t.mask.stride), (16, 8, 32));
+    assert!(mask_rows(&dec).iter().flatten().all(|&v| v == 255));
+    // A transparent single-value mask, with the row delta set: the
+    // delta applies to run-coded masks only.
+    let f = transparent_intra_frame(&[], None, |w| {
+        w.put(1, 1); // row delta
+        w.put(0, 1); // no descriptor
+        w.align();
+        w.put(1, 1);
+        w.put(0, 1); // transparent
+    });
+    assert_eq!(dec.decode(&f), Ok(FrameType::Intra));
+    let t = dec.transparency().unwrap();
+    assert_eq!(t.colour, None);
+    assert!(t.rects.is_empty());
+    assert!(mask_rows(&dec).iter().flatten().all(|&v| v == 0));
+}
+
+#[test]
+fn transparency_mask_runs() {
+    // Runs cover 32 samples a row (16 visible); 2 transparent, then 254
+    // opaque.
+    let mut dec = Iv50Decoder::new();
+    let f = transparent_intra_frame(&[(2, 0, 14, 8)], None, run_mask(false, true, 0, &[2, 254]));
+    assert_eq!(dec.decode(&f), Ok(FrameType::Intra));
+    let m = mask_rows(&dec);
+    assert_eq!(m[0][..2], [0, 0]);
+    assert!(m[0][2..].iter().all(|&v| v == 255));
+    assert!(m[1..].iter().flatten().all(|&v| v == 255));
+    // Code 0 is 255 samples and keeps the value for the next run: one
+    // opaque run of 256.
+    let f = transparent_intra_frame(&[], None, run_mask(false, true, 1, &[0, 1]));
+    assert_eq!(dec.decode(&f), Ok(FrameType::Intra));
+    assert!(mask_rows(&dec).iter().flatten().all(|&v| v == 255));
+    // Any other code flips the value after its run.
+    let f = transparent_intra_frame(&[], None, run_mask(false, true, 1, &[1, 0]));
+    assert_eq!(dec.decode(&f), Ok(FrameType::Intra));
+    let m = mask_rows(&dec);
+    assert_eq!(m[0][0], 255);
+    assert!(m.iter().flatten().skip(1).all(|&v| v == 0));
+}
+
+#[test]
+fn transparency_mask_row_delta() {
+    // The same runs with the row delta: each row is XORed with the
+    // decoded row above, so the rows alternate.
+    let mut dec = Iv50Decoder::new();
+    let f = transparent_intra_frame(&[], None, run_mask(true, true, 0, &[2, 254]));
+    assert_eq!(dec.decode(&f), Ok(FrameType::Intra));
+    for (r, row) in mask_rows(&dec).iter().enumerate() {
+        let (left, right) = if r % 2 == 0 { (0, 255) } else { (255, 0) };
+        assert_eq!(row[..2], [left, left], "row {r}");
+        assert!(row[2..].iter().all(|&v| v == right), "row {r}");
+    }
+}
+
+#[test]
+fn transparency_mask_size_fields() {
+    // An 8-bit size, and 0xff followed by a 24-bit size: both are read
+    // and skipped.
+    for long in [false, true] {
+        let mut dec = Iv50Decoder::new();
+        let f = transparent_intra_frame(&[], None, |w| {
+            w.put(0, 1);
+            w.put(1, 1);
+            w.put(MASK_ROWS.len() as u32, 4);
+            for r in MASK_ROWS {
+                w.put(r as u32, 4);
+            }
+            w.align();
+            w.put(0, 1);
+            w.put(1, 1); // size
+            if long {
+                w.put(0xff, 8);
+                w.put(0x123, 24);
+            } else {
+                w.put(9, 8);
+            }
+            w.align();
+            w.put(0, 1);
+            w.sym(&MASK_ROWS, 2);
+            w.sym(&MASK_ROWS, 254);
+        });
+        assert_eq!(dec.decode(&f), Ok(FrameType::Intra), "long {long}");
+        let m = mask_rows(&dec);
+        assert_eq!(m[0][..3], [0, 0, 255], "long {long}");
+    }
+}
+
+#[test]
+fn transparency_descriptor_stays_and_null_frames_keep_the_mask() {
+    let mut dec = Iv50Decoder::new();
+    // No descriptor before the first one: the run-coded mask can't
+    // decode.
+    let f = transparent_intra_frame(&[], None, run_mask(false, false, 0, &[]));
+    assert_eq!(
+        dec.decode(&f),
+        Err(Iv50Error::BadHeader(
+            "transparency mask without a code descriptor"
+        ))
+    );
+    assert!(dec.transparency().is_none());
+    let f = transparent_intra_frame(&[(2, 0, 14, 8)], None, run_mask(false, true, 0, &[2, 254]));
+    dec.decode(&f).unwrap();
+    // A later frame without a descriptor uses the last one.
+    let f = transparent_intra_frame(&[(4, 0, 12, 8)], None, run_mask(false, false, 0, &[4, 252]));
+    assert_eq!(dec.decode(&f), Ok(FrameType::Intra));
+    let m = mask_rows(&dec);
+    assert_eq!(m[0][..5], [0, 0, 0, 0, 255]);
+    // A NULL frame keeps the picture and its transparency.
+    let mut w = BitWriter::new();
+    w.put(0x1f, 5);
+    w.put(4, 3);
+    w.put(1, 8);
+    assert_eq!(dec.decode(&w.bytes), Ok(FrameType::Null));
+    assert_eq!(dec.transparency().unwrap().rects[0].x, 4);
+    assert_eq!(mask_rows(&dec), m);
+    // A frame whose mask data ends early fails and keeps the last mask.
+    // The mask data is 19 bits: the first value and two codes of 9 bits.
+    let mut f =
+        transparent_intra_frame(&[(0, 0, 16, 8)], None, run_mask(false, false, 0, &[2, 254]));
+    f.truncate(f.len() - 2);
+    assert_eq!(dec.decode(&f), Err(Iv50Error::Truncated));
+    assert_eq!(dec.transparency().unwrap().rects[0].x, 4);
+    assert_eq!(mask_rows(&dec), m);
+}
+
+#[test]
+fn no_transparency_without_gop_flag() {
+    let mut dec = Iv50Decoder::new();
+    dec.decode(&intra_frame()).unwrap();
+    assert!(dec.transparency().is_none());
+}
+
+/// The trailer that `rest` completes after `rects`, as the bytes that
+/// follow a frame's last band.
+fn trailer(rects: &[(u32, u32, u32, u32)], rest: impl FnOnce(&mut BitWriter)) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.put(rects.len() as u32, 3);
+    for &(x, y, rw, rh) in rects {
+        w.put(x, 16);
+        w.put(y, 16);
+        w.put(rw, 16);
+        w.put(rh, 16);
+    }
+    rest(&mut w);
+    w.bytes
+}
+
+/// An inter frame like [`inter_frame`] in a stream with transparency:
+/// the trailer follows its bands.
+fn transparent_inter_frame(number: u32, trailer: &[u8]) -> Vec<u8> {
+    let mut f = inter_frame(number);
+    f.extend_from_slice(trailer);
+    f
+}
+
+#[test]
+fn transparency_mask_of_inter_frames() {
+    let mut dec = Iv50Decoder::new();
+    let f = transparent_intra_frame(&[(0, 0, 16, 8)], None, run_mask(false, true, 0, &[2, 254]));
+    dec.decode(&f).unwrap();
+    // An inter frame carries a mask of its own, here with the
+    // descriptor of the intra frame: 3 opaque, then transparent.
+    let t = trailer(&[(0, 0, 16, 8)], run_mask(false, false, 1, &[3, 253]));
+    let f = transparent_inter_frame(1, &t);
+    assert_eq!(dec.decode(&f), Ok(FrameType::Inter));
+    let m = mask_rows(&dec);
+    assert_eq!(m[0][..4], [255, 255, 255, 0]);
+    assert!(
+        m[0][4..]
+            .iter()
+            .chain(m[1..].iter().flatten())
+            .all(|&v| v == 0)
+    );
+    // An inter frame whose mask is cut short fails and keeps it.
+    let f = transparent_inter_frame(2, &t[..t.len() - 2]);
+    assert_eq!(dec.decode(&f), Err(Iv50Error::Truncated));
+    assert_eq!(mask_rows(&dec), m);
+}
+
+#[test]
+fn transparency_runs_past_the_end_are_cut() {
+    let mut dec = Iv50Decoder::new();
+    // 2 + 255 samples for a mask of 256.
+    let f = transparent_intra_frame(&[], None, run_mask(false, true, 0, &[2, 255]));
+    assert_eq!(dec.decode(&f), Ok(FrameType::Intra));
+    let m = mask_rows(&dec);
+    assert_eq!(m[0][..3], [0, 0, 255]);
+    assert!(m[1..].iter().flatten().all(|&v| v == 255));
+    // Two runs of 255 that keep the value: the second ends past the
+    // mask.
+    let f = transparent_intra_frame(&[], None, run_mask(false, true, 0, &[0, 0]));
+    assert_eq!(dec.decode(&f), Ok(FrameType::Intra));
+    assert!(mask_rows(&dec).iter().flatten().all(|&v| v == 0));
+}
+
+#[test]
+fn transparency_descriptors_that_code_nothing_fail() {
+    let mut dec = Iv50Decoder::new();
+    let f = transparent_intra_frame(&[], None, run_mask(false, true, 0, &[2, 254]));
+    dec.decode(&f).unwrap();
+    let m = mask_rows(&dec);
+    // A descriptor of no rows, even for a single-value mask.
+    let f = transparent_intra_frame(&[], None, |w| {
+        w.put(0, 1);
+        w.put(1, 1);
+        w.put(0, 4);
+        w.align();
+        w.put(1, 1);
+        w.put(1, 1);
+    });
+    assert_eq!(
+        dec.decode(&f),
+        Err(Iv50Error::BadHeader("transparency mask descriptor"))
+    );
+    // One row of no bits: a code of no length, which decodes nothing
+    // and must not run without end.
+    let f = transparent_intra_frame(&[], None, |w| {
+        w.put(0, 1);
+        w.put(1, 1);
+        w.put(1, 4);
+        w.put(0, 4);
+        w.align();
+        w.put(0, 1);
+        w.put(0, 1);
+        w.align();
+        w.put(0, 1);
+    });
+    assert_eq!(
+        dec.decode(&f),
+        Err(Iv50Error::BadHeader("transparency mask code"))
+    );
+    assert_eq!(mask_rows(&dec), m);
+}
+
+#[test]
+fn a_frame_without_transparency_drops_the_mask() {
+    let mut dec = Iv50Decoder::new();
+    // A transparent picture, then one of the same size in a GOP without
+    // transparency.
+    let f = transparent_intra_frame(&[], None, |w| {
+        w.put(0, 2);
+        w.align();
+        w.put(1, 1);
+        w.put(0, 1);
+    });
+    dec.decode(&f).unwrap();
+    dec.decode(&intra_frame()).unwrap();
+    assert!(dec.transparency().is_none());
+    // A transparency frame that fails keeps the picture without
+    // transparency, so there is still no mask to give.
+    let mut f = transparent_intra_frame(&[], None, run_mask(false, true, 0, &[2, 254]));
+    f.truncate(f.len() - 2);
+    assert_eq!(dec.decode(&f), Err(Iv50Error::Truncated));
+    assert!(dec.y().is_some());
+    assert!(dec.transparency().is_none());
+}
+
+/// Every cut and every one-bit change of frames with transparency
+/// decodes or fails without a panic, and leaves a mask that covers the
+/// picture.
+#[test]
+fn damaged_transparency_frames_never_panic() {
+    let good = transparent_intra_frame(&[(0, 0, 16, 8)], None, run_mask(false, true, 0, &[2, 254]));
+    let mut frames = vec![
+        good.clone(),
+        transparent_intra_frame(
+            &[(1, 2, 3, 4)],
+            Some(0x10203),
+            run_mask(true, true, 1, &[7, 0, 3]),
+        ),
+        transparent_intra_frame(&[], None, opaque_mask),
+    ];
+    for long in [false, true] {
+        frames.push(transparent_intra_frame(&[], None, move |w| {
+            w.put(1, 1);
+            w.put(1, 1);
+            w.put(MASK_ROWS.len() as u32, 4);
+            for r in MASK_ROWS {
+                w.put(r as u32, 4);
+            }
+            w.align();
+            w.put(0, 1);
+            w.put(1, 1);
+            if long {
+                w.put(0xff, 8);
+                w.put(0x123, 24);
+            } else {
+                w.put(9, 8);
+            }
+            w.align();
+            w.put(0, 1);
+            w.sym(&MASK_ROWS, 30);
+            w.sym(&MASK_ROWS, 0);
+        }));
+    }
+    let inter = transparent_inter_frame(
+        1,
+        &trailer(&[(0, 0, 16, 8)], run_mask(true, false, 1, &[3, 253])),
+    );
+    let check = |dec: &Iv50Decoder| {
+        if let Some(t) = dec.transparency() {
+            let m = t.mask;
+            assert!(m.stride >= m.width && m.data.len() >= m.stride * m.height);
+            assert!(m.data.iter().all(|&v| v == 0 || v == 255));
+        }
+    };
+    let damaged = |f: &[u8]| {
+        let mut out: Vec<Vec<u8>> = (0..f.len()).map(|n| f[..n].to_vec()).collect();
+        for bit in 0..f.len() * 8 {
+            let mut g = f.to_vec();
+            g[bit / 8] ^= 1 << (bit % 8);
+            out.push(g);
+        }
+        out
+    };
+    for f in &frames {
+        for g in damaged(f) {
+            // On its own, and after a good picture.
+            let mut dec = Iv50Decoder::new();
+            let _ = dec.decode(&g);
+            check(&dec);
+            let mut dec = Iv50Decoder::new();
+            dec.decode(&good).unwrap();
+            let _ = dec.decode(&g);
+            check(&dec);
+        }
+    }
+    for g in damaged(&inter) {
+        let mut dec = Iv50Decoder::new();
+        dec.decode(&good).unwrap();
+        let _ = dec.decode(&g);
+        check(&dec);
     }
 }
 

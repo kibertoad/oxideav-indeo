@@ -90,6 +90,17 @@ the four-band synthesis filter, half-size as well as quarter-size
 chroma, and the transparency bounding box that limits which part of
 the picture a frame rebuilds.
 
+**Transparency.** For a stream with transparency (gop_flags bit 3),
+`Iv50Decoder::transparency()` gives the GOP header's transparency
+colour, the frame's rectangles and a per-pixel mask decoded from the
+frame trailer's run-length code. The planes keep the whole picture;
+the mask says which pixels are opaque. The staged specification has no
+section for the trailer: its layout was worked out from the streams.
+The vendor driver, decoding to an RGB DIB, writes the transparency
+colour (black when the stream has none) to every transparent pixel,
+and on the 21 Rent-A-Hero movies with transparency the decoded mask
+equals the pixels it fills on every frame compared (1 844 frames).
+
 **Specification.** Comments cite the staged clean-room specification
 (`docs/video/indeo/indeo5/spec/` by chapter and section, and its
 `tables/`). Every decoder table is compared with the staged table files
@@ -157,7 +168,8 @@ band quantiser above 23.
   seek INTRA gate, NULL repeat, reference bank).
 - `indeo5::Iv50Decoder::decode` → `FrameType`; `y()` / `u()` / `v()`
   → `Iv50Plane` (width, height, stride, samples); `chroma_ratio()`;
-  `yuy2()`; `Iv50Error`.
+  `yuy2()`; `transparency()` → `Iv50Transparency` (colour,
+  `Iv50Rect`s, mask as an `Iv50Plane`); `Iv50Error`.
 - Registry: `register` (crate root), `indeo3::register_codecs` /
   `indeo5::register`, `codec_id_for_fourcc`, `probe`.
 

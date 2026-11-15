@@ -5,15 +5,16 @@
 //! chunk) and keeps the state that spans frames: the GOP header, three
 //! sets of band buffers that rotate by frame type (spec/07 §1.2, §1.3), the
 //! luma band 0 macroblock records that later bands inherit from (spec/06
-//! §5.2), the transparency bounding box, and the output planes, which
-//! persist because a transparency frame only rebuilds its bounding box.
+//! §5.2), the transparency bounding box, mask and mask code, and the
+//! output planes, which persist because a transparency frame only
+//! rebuilds its bounding box.
 //!
 //! A frame is decoded in this order: picture start (spec/01 §3), GOP
 //! header for intra frames and frame header (spec/02 §1, §2), every band
 //! in bitstream order (luma bands, then the bands of chroma plane 1 (V),
 //! then those of chroma plane 2 (U); spec/02 §4.4), the transparency
-//! trailer, the buffer rotation and the recombination of the bands into
-//! the 8-bit planes (spec/08 §3).
+//! trailer with its rectangles and mask, the buffer rotation and the
+//! recombination of the bands into the 8-bit planes (spec/08 §3).
 //!
 //! # Specification
 //!
@@ -66,13 +67,24 @@
 //!   the GOP header.
 //! * Not exercised: the four-point transform (the `(5, 2)` stage alone,
 //!   as spec/06 §2.3 words it), the fill values of an empty band, the
-//!   transparency trailer and its window, the extra block of an odd row
-//!   of one-block macroblocks, half-sample vectors, empty tiles, and the
-//!   edge rules and rounding of the four-band synthesis. Away from the
+//!   transparency window, the extra block of an odd row of one-block
+//!   macroblocks, half-sample vectors, empty tiles, and the edge rules
+//!   and rounding of the four-band synthesis. Away from the
 //!   edges that synthesis is the filter pair of spec/06 §3.2 applied as
 //!   a plain upsample-and-filter, a quarter of the bands' sum truncated
 //!   once (a unit test compares the two); frame types 2 and 3 follow
 //!   spec/07 §1.5 (also under test).
+//!
+//! ## Transparency mask
+//!
+//! The staged text has no section for the frame trailer that carries
+//! the rectangles and the mask, and no staged fixture has transparency.
+//! The layout (`mask.rs`) was worked out from the Rent-A-Hero movies
+//! with transparency and confirmed by measuring the vendor driver's
+//! output: on those movies every run-coded mask ends exactly at the end
+//! of the picture and at the trailer's size, and the mask equals the
+//! pixels that the vendor driver, converting to RGB, fills with the
+//! transparency colour ([`Iv50Transparency`]).
 //!
 //! ## Refused
 //!
@@ -90,10 +102,13 @@ mod band;
 mod bits;
 mod headers;
 mod huff;
+mod mask;
 mod synth;
 mod tables;
 mod xform;
 mod yuy2;
+
+pub use mask::Iv50Rect;
 
 use band::{B0Rec, BandGeom, BandJob, Bank, TileGeom, build_bank, fill_empty_band};
 use bits::PaddedFrame;
@@ -201,6 +216,37 @@ impl Iv50Plane<'_> {
     }
 }
 
+/// The transparency of the current picture, for a stream whose GOP
+/// header sets gop_flags bit 3 (spec/02 §1.8 for the colour).
+///
+/// The planes hold the decoded picture everywhere, transparent pixels
+/// included; the mask says which pixels to show. The vendor driver,
+/// asked for RGB output (`ICM_DECOMPRESS` to a 16 or 24-bit DIB),
+/// writes every pixel: the picture where the mask is opaque and
+/// [`colour`](Self::colour) where it is transparent, black when the
+/// stream gives no colour. An application keys that colour out, or
+/// takes the mask.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct Iv50Transparency<'a> {
+    /// The GOP header's transparency colour as `[red, green, blue]`, or
+    /// `None` when it carries none.
+    pub colour: Option<[u8; 3]>,
+    /// The rectangles of the last frame's trailer. A frame with none
+    /// leaves the part of the picture it rebuilds as it was.
+    pub rects: &'a [Iv50Rect],
+    /// One sample per luma pixel: 255 where the picture is opaque, 0
+    /// where it is transparent.
+    pub mask: Iv50Plane<'a>,
+}
+
+/// What a frame's transparency trailer gives besides its mask: the
+/// rectangles, and the run code when the trailer carries a descriptor.
+struct Trailer {
+    rects: Vec<Iv50Rect>,
+    code: Option<Huff>,
+}
+
 /// The geometry of one plane: its size and its bands.
 #[derive(Debug, Clone)]
 struct PlaneLayout {
@@ -237,6 +283,15 @@ pub struct Iv50Decoder {
     out: Vec<OutPlane>,
     /// Transparency bounding box (y, x, h, w).
     bbox: Option<(usize, usize, usize, usize)>,
+    /// The last frame's transparency rectangles and mask
+    /// (`mask::stride(width)` samples per row), whether the mask holds
+    /// a decoded one, the buffer the next frame's mask decodes into, and
+    /// the mask's run code in force.
+    rects: Vec<Iv50Rect>,
+    mask: Vec<u8>,
+    have_mask: bool,
+    mask_next: Vec<u8>,
+    mask_code: Option<Huff>,
     bank: Box<Bank>,
     /// Largest picture area accepted, in luma pixels.
     max_pixels: u64,
@@ -276,6 +331,11 @@ impl Iv50Decoder {
             prev_number: None,
             out: Vec::new(),
             bbox: None,
+            rects: Vec::new(),
+            mask: Vec::new(),
+            have_mask: false,
+            mask_next: Vec::new(),
+            mask_code: None,
             bank: build_bank(),
             max_pixels: MAX_PICTURE_PIXELS,
             mb_huffs: Vec::new(),
@@ -340,6 +400,30 @@ impl Iv50Decoder {
     /// bit 1 set, spec/02 §1.6). `None` before the first GOP header.
     pub fn chroma_ratio(&self) -> Option<usize> {
         self.gop.as_ref().map(|g| 1 << g.chroma_shift())
+    }
+
+    /// The transparency of the current picture: `None` when the stream
+    /// has none (gop_flags bit 3 clear) or before the first picture. A
+    /// NULL frame and a frame that fails keep the last frame's; a frame
+    /// of a GOP without transparency drops it.
+    pub fn transparency(&self) -> Option<Iv50Transparency<'_>> {
+        let gop = self.gop.as_ref()?;
+        if !gop.transparency || !self.have_picture || !self.have_mask {
+            return None;
+        }
+        let (w, h) = (gop.width as usize, gop.height as usize);
+        Some(Iv50Transparency {
+            colour: gop
+                .colour
+                .map(|c| [c as u8, (c >> 8) as u8, (c >> 16) as u8]),
+            rects: &self.rects,
+            mask: Iv50Plane {
+                width: w,
+                height: h,
+                stride: mask::stride(w),
+                data: &self.mask,
+            },
+        })
     }
 
     fn plane(&self, i: usize) -> Option<Iv50Plane<'_>> {
@@ -418,10 +502,23 @@ impl Iv50Decoder {
         }
         let decoded = self.w;
         match self.decode_bands(&frame, r.byte_pos(), ftype, &fh) {
-            Ok(rects) => {
-                if !rects.is_empty() {
-                    self.set_bbox(&rects);
+            Ok(Some(t)) => {
+                if !t.rects.is_empty() {
+                    self.set_bbox(&t.rects);
                 }
+                self.rects = t.rects;
+                if t.code.is_some() {
+                    self.mask_code = t.code;
+                }
+                std::mem::swap(&mut self.mask, &mut self.mask_next);
+                self.have_mask = true;
+            }
+            Ok(None) => {
+                // A frame of a GOP without transparency: the last mask
+                // doesn't describe its picture, nor the one a later
+                // frame that fails leaves in place.
+                self.rects.clear();
+                self.have_mask = false;
             }
             Err(e) => {
                 (self.w, self.r1, self.r2, self.r2_valid) = saved;
@@ -486,6 +583,8 @@ impl Iv50Decoder {
                 .map(|p| OutPlane::new(p.width, p.height))
                 .collect();
             self.bbox = None;
+            self.rects.clear();
+            self.have_mask = false;
             self.have_picture = false;
         } else {
             self.b0.resize(b0_count, B0Rec::default());
@@ -508,14 +607,15 @@ impl Iv50Decoder {
     }
 
     /// Decode every band of the frame into buffer set W, starting at
-    /// byte `pos`. Returns the transparency rectangles.
+    /// byte `pos`, and in a stream with transparency the trailer after
+    /// them, whose mask goes to `mask_next`.
     fn decode_bands(
         &mut self,
         frame: &PaddedFrame,
         mut pos: usize,
         ftype: u32,
         fh: &headers::FrameHeader,
-    ) -> Result<Vec<(u32, u32, u32, u32)>, Iv50Error> {
+    ) -> Result<Option<Trailer>, Iv50Error> {
         let mb_idx = Self::huff_index(&mut self.mb_huffs, &fh.mb_rows)?;
         let gop = self.gop.as_ref().expect("GOP checked by the caller");
         let b0_mb_size = gop.luma_info[0].mb_size;
@@ -567,23 +667,42 @@ impl Iv50Decoder {
                 };
             }
         }
-        if transparency {
-            let mut r = frame.reader_at(pos);
-            let rects = headers::read_transparency_rects(&mut r, fh.flags);
-            if r.overrun() {
-                return Err(Iv50Error::Truncated);
-            }
-            return Ok(rects);
+        if !transparency {
+            return Ok(None);
         }
-        Ok(Vec::new())
+        let (w, h) = (gop.width as usize, gop.height as usize);
+        let mut r = frame.reader_at(pos);
+        let t = mask::read_header(&mut r, fh.flags);
+        if r.overrun() {
+            return Err(Iv50Error::Truncated);
+        }
+        let code = match &t.descriptor {
+            Some(rows) => {
+                Some(Huff::new(rows).ok_or(Iv50Error::BadHeader("transparency mask descriptor"))?)
+            }
+            None => None,
+        };
+        let stride = mask::stride(w);
+        self.mask_next.resize(stride * h, 0);
+        mask::read_mask(
+            &mut r,
+            code.as_ref().or(self.mask_code.as_ref()),
+            t.row_delta,
+            stride,
+            &mut self.mask_next,
+        )?;
+        Ok(Some(Trailer {
+            rects: t.rects,
+            code,
+        }))
     }
 
     /// Store the union of the frame's transparency rectangles.
-    fn set_bbox(&mut self, rects: &[(u32, u32, u32, u32)]) {
-        let x0 = rects.iter().map(|r| r.0).min().unwrap_or(0) as usize;
-        let y0 = rects.iter().map(|r| r.1).min().unwrap_or(0) as usize;
-        let x1 = rects.iter().map(|r| r.0 + r.2).max().unwrap_or(0) as usize;
-        let y1 = rects.iter().map(|r| r.1 + r.3).max().unwrap_or(0) as usize;
+    fn set_bbox(&mut self, rects: &[Iv50Rect]) {
+        let x0 = rects.iter().map(|r| r.x).min().unwrap_or(0) as usize;
+        let y0 = rects.iter().map(|r| r.y).min().unwrap_or(0) as usize;
+        let x1 = rects.iter().map(|r| r.x + r.width).max().unwrap_or(0) as usize;
+        let y1 = rects.iter().map(|r| r.y + r.height).max().unwrap_or(0) as usize;
         self.bbox = Some((y0, x0, y1 - y0, x1 - x0));
     }
 

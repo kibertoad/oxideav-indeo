@@ -12,10 +12,13 @@
 //! spans frames. Its 8-bit planes follow the vendor driver
 //! (IR50_32.DLL R.5.06.15.2.44, MMX path): intra, inter and NULL frames,
 //! one-band and four-band luma, and the transparency window that limits
-//! which part of the picture a frame rebuilds. Features that no known
-//! stream uses and whose decoding is not established (several tiles,
-//! half-size chroma, locked streams, seven-band luma, four-band chroma,
-//! bitstream versions other than 2) return [`Iv50Error::Unsupported`].
+//! which part of the picture a frame rebuilds.
+//! [`Iv50Decoder::transparency`] gives a transparency stream's colour,
+//! rectangles and per-pixel mask, which the vendor driver applies when
+//! it converts to RGB. Features that no known stream uses and whose
+//! decoding is not established (several tiles, half-size chroma, locked
+//! streams, seven-band luma, four-band chroma, bitstream versions other
+//! than 2) return [`Iv50Error::Unsupported`].
 //!
 //! [`Indeo5RegistryDecoder`] and [`decode_video_frame`] bridge the
 //! decoder to the `oxideav_core` codec registry.
@@ -23,7 +26,9 @@
 mod decoder;
 mod registry;
 
-pub use decoder::{FrameType, Iv50Decoder, Iv50Error, Iv50Plane, MAX_PICTURE_PIXELS};
+pub use decoder::{
+    FrameType, Iv50Decoder, Iv50Error, Iv50Plane, Iv50Rect, Iv50Transparency, MAX_PICTURE_PIXELS,
+};
 pub use registry::{
     CODEC_ID_STR, INDEO5_FOURCCS, Indeo5RegistryDecoder, PROBE_CONFIDENCE_HEADER_OK,
     PROBE_CONFIDENCE_TAG_ONLY, codec_id_for_fourcc, decode_video_frame, make_decoder, probe,

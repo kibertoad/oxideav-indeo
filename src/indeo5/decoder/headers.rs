@@ -75,6 +75,9 @@ pub(crate) struct GopHeader {
     pub chroma_info: Vec<BandInfo>,
     /// gop_flags bit 3: frames carry a transparency trailer.
     pub transparency: bool,
+    /// The transparency colour (spec/02 §1.8), when the GOP header
+    /// carries one: red in bits 0..7, green in 8..15, blue in 16..23.
+    pub colour: Option<u32>,
     /// gop_flags bit 2: the stream has intra frames only (a predicted
     /// frame under such a GOP header is an error, spec/07 §1.1).
     pub intra_only: bool,
@@ -187,14 +190,14 @@ pub(crate) fn read_gop(r: &mut Bits) -> Result<GopHeader, Iv50Error> {
         chroma_info.push(read_band_info(r, b, 1)?);
     }
     let transparency = flags & 8 != 0;
+    let mut colour = None;
     if transparency {
         let t = r.read(4);
         if t & 7 != 0 {
             return Err(Iv50Error::BadHeader("transparency flags"));
         }
         if t & 8 != 0 {
-            // Transparency colour: only the application uses it.
-            r.read(24);
+            colour = Some(r.read(24));
         }
     }
     r.align();
@@ -224,6 +227,7 @@ pub(crate) fn read_gop(r: &mut Bits) -> Result<GopHeader, Iv50Error> {
         luma_info,
         chroma_info,
         transparency,
+        colour,
         intra_only: flags & 4 != 0,
     })
 }
@@ -374,28 +378,6 @@ pub(crate) fn read_band_header(r: &mut Bits, frame_flags: u32) -> Result<BandHea
         return Err(Iv50Error::Truncated);
     }
     Ok(h)
-}
-
-/// Transparency rectangles of the frame trailer, as (x, y, w, h): after
-/// the last band, a 24-bit size when frame_flags bit 0 is set, a 3-bit
-/// count and four 16-bit fields per rectangle. The staged specification
-/// covers the GOP header's transparency block (spec/02 §1.8) but not
-/// this trailer; see "Beyond the staged specification" in the module
-/// docs.
-pub(crate) fn read_transparency_rects(r: &mut Bits, frame_flags: u32) -> Vec<(u32, u32, u32, u32)> {
-    if frame_flags & 1 != 0 {
-        r.read(24);
-    }
-    let n = r.read(3);
-    (0..n)
-        .map(|_| {
-            let x = r.read(16);
-            let y = r.read(16);
-            let w = r.read(16);
-            let h = r.read(16);
-            (x, y, w, h)
-        })
-        .collect()
 }
 
 #[cfg(test)]

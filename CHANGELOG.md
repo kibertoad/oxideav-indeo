@@ -8,6 +8,13 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- indeo5: `Iv50Decoder::transparency` gives a transparency stream's
+  colour (`[red, green, blue]` from the GOP header), the rectangles of
+  the last frame's trailer (`Iv50Rect`) and the per-pixel mask the
+  trailer codes: a single value, or run lengths in a prefix code whose
+  descriptor stays in force for later frames, with an optional XOR of
+  each row with the row above. A frame without a trailer (a GOP
+  without transparency) drops the mask
 - indeo5: `Iv50Decoder::yuy2`, the picture as packed `YUY2` with the
   vendor driver's chroma interpolation (`spec/08` §3.4a)
 - indeo5: the staged vendor-encoded inter fixture (176x144, one intra
@@ -65,6 +72,11 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- indeo5: the transparency trailer is read to its end, so a frame of a
+  transparency stream whose mask data is cut short fails with
+  `Truncated`, and one whose mask needs a code it has no descriptor
+  for, or whose descriptor codes nothing, fails with `BadHeader`.
+  Before, such a frame decoded with its mask unread
 - indeo5: decoding is 1.6 to 1.9 times as fast and the registry bridge
   2.2 to 3 times (176x144 inter sequence 63.7 to 38.1 µs per frame,
   320x240 intra 65.7 to 34.2 µs; through the registry 103.7 to 47.1 and
